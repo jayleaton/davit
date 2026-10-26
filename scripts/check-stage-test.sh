@@ -12,6 +12,9 @@
 #   - `make fmt-check` stays clean after an unsharded go pass, even with a
 #     broken .go file under .build/, and still fails on real source.
 set -euo pipefail
+# The stamps are under test: a CHECK_FORCE from the caller (CI sets it) would
+# make every stamped stage rerun.
+unset CHECK_FORCE
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 if ! gofmt_bin="$(cd "$root" && mise which gofmt 2>/dev/null)"; then

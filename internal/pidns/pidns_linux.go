@@ -1,10 +1,12 @@
 package pidns
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -16,7 +18,9 @@ const envKey = "DAVIT_PIDNS_TEST"
 // Isolated reports whether t runs inside its private namespaces. Outside, it
 // runs t's test function again in them (the child's output is logged), fails
 // t if that run fails, and returns false: the caller returns too. It skips t
-// where unprivileged user namespaces are not allowed.
+// where unprivileged user namespaces are not allowed, or are created without
+// the right to mount (Ubuntu 24.04's AppArmor policy,
+// kernel.apparmor_restrict_unprivileged_userns).
 //
 //	func TestX(t *testing.T) {
 //		if !pidns.Isolated(t) {
@@ -29,6 +33,9 @@ func Isolated(t *testing.T) bool {
 	if os.Getenv(envKey) == t.Name() {
 		// Inside: make mounts private, then give /proc to this PID namespace.
 		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+				t.Skipf("pidns: user namespace without mount rights (AppArmor userns restriction?): %v", err)
+			}
 			t.Fatalf("pidns: private mounts: %v", err)
 		}
 		if err := unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
@@ -47,6 +54,9 @@ func Isolated(t *testing.T) bool {
 	out, err := cmd.CombinedOutput()
 	if cmd.ProcessState == nil { // never started: namespaces not allowed here
 		t.Skipf("pidns: no unprivileged user+PID namespaces: %v", err)
+	}
+	if err == nil && strings.Contains(string(out), "--- SKIP: "+t.Name()+" ") {
+		t.Skipf("pidns: skipped in private namespaces:\n%s", out)
 	}
 	t.Logf("in private namespaces:\n%s", out)
 	if err != nil {

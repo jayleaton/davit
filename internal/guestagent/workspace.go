@@ -59,11 +59,15 @@ func (s *session) prepareWorkspace(id uint64, req guestproto.WorkspacePrepare) {
 		s.fail(id, guestproto.Errorf(guestproto.CodeInvalidArgument, "a workspace preparation is already running"))
 		return
 	}
-	defer s.a.workspace.Unlock()
 	w := &workspaceRun{s: s, stream: id, secrets: secretsOf(req)}
-	res := w.run(req)
+	res := func() guestproto.WorkspaceResult {
+		defer s.a.workspace.Unlock()
+		return w.run(req)
+	}()
 	res.Revision = req.Revision
 	res.Message = w.redact(res.Message)
+	// The result is sent only after the lock is released: a client that has
+	// seen it may start the next preparation at once and must not be refused.
 	w.emit(res)
 }
 

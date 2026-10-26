@@ -86,6 +86,10 @@ show-user*) [ -e "` + linger + `" ] && echo yes || echo no ;;
 enable-linger*) touch "` + linger + `" ;;
 esac`,
 		"journalctl": `exit 0`,
+		// Free space is the fixture's, not the test machine's (CI runners
+		// have little): FAKE_DF_AVAIL_KIB, default 100 GiB.
+		"df": `echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "fake 209715200 0 ${FAKE_DF_AVAIL_KIB:-104857600} 0% /"`,
 	}
 	if err := os.MkdirAll(h.stubs, 0o755); err != nil {
 		t.Fatal(err)
@@ -207,6 +211,20 @@ func TestInstallHostDoctorFails(t *testing.T) {
 	out, err := h.runHost(t, map[string]string{"FAKE_DOCTOR_FAIL": "1"})
 	if err == nil || !strings.Contains(out, "doctor reports a problem") {
 		t.Fatalf("want a doctor failure, got %v\n%s", err, out)
+	}
+}
+
+// TestInstallHostLowDisk: too little room for the image stops the install
+// before any download, naming the data dir and --data-dir.
+func TestInstallHostLowDisk(t *testing.T) {
+	requireTools(t)
+	h := newHostFixture(t)
+	out, err := h.runHost(t, map[string]string{"FAKE_DF_AVAIL_KIB": "3145728"})
+	if err == nil || !strings.Contains(out, "has 3 GiB free") || !strings.Contains(out, "--data-dir") {
+		t.Fatalf("want a low-disk refusal, got %v\n%s", err, out)
+	}
+	if strings.Contains(out, "image ubuntu-24.04-dev") {
+		t.Fatalf("an image was installed despite the refusal:\n%s", out)
 	}
 }
 
