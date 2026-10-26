@@ -1,0 +1,35 @@
+#!/bin/sh
+# Fake Codex for tests: emits `codex exec --json` lines. `exec resume ...
+# SESSION -` resumes SESSION; the prompt is on stdin. It echoes the
+# reasoning effort, service tier and --image files it was given.
+prompt=$(tr '\n' ' ')
+session=""
+resume=no
+effort=none
+fast=no
+images=""
+prev=""
+for a in "$@"; do
+	[ "$a" = resume ] && resume=yes
+	[ "$a" = - ] && [ $resume = yes ] && session=$prev
+	[ "$prev" = --image ] && images="$images $a"
+	case "$a" in
+	model_reasoning_effort=*) effort=$(printf '%s' "${a#*=}" | tr -d '"') ;;
+	'service_tier="fast"') fast=yes ;;
+	esac
+	prev=$a
+done
+resumed=${session:-none}
+[ -n "$session" ] || session="thread-$$"
+echo '{"type":"thread.started","thread_id":"'"$session"'"}'
+echo '{"type":"turn.started"}'
+case "$prompt" in
+*slow*) sleep 3 ;;
+*fail*)
+	echo '{"type":"turn.failed","error":{"message":"401 Unauthorized"}}'
+	exit 1 ;;
+esac
+echo '{"type":"item.started","item":{"id":"i1","type":"command_execution","command":"ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls","aggregated_output":"a.txt\n","exit_code":0,"status":"completed"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"echo: '"$prompt"' resumed='"$resumed"' effort='"$effort"' fast='"$fast"' images='"${images# }"' key='"$OPENAI_API_KEY"' base='"$OPENAI_BASE_URL"'"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":5}}'

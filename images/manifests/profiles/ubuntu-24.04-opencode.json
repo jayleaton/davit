@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "profile",
+  "status": "declared",
+  "name": "ubuntu-24.04-opencode",
+  "base": "ubuntu-24.04-base",
+  "arches": ["x86_64", "aarch64"],
+  "description": "base + Node.js (/opt/node) + the OpenCode CLI (/opt/davit-harness, linked into /usr/local/bin). Not built yet: no kernel, rootfs or recipe digests until images/build.sh produces images/manifests/ubuntu-24.04-opencode.json.",
+  "node": "v24.22.1",
+  "capabilities": {
+    "harness.opencode": {
+      "command": "opencode",
+      "npmPackage": "opencode-ai",
+      "version": "1.19.3",
+      "integrity": "sha512-wDRcUlMDibaLzecIGvVGUA9naghXVqzCWcUE7N3qagpGiLSUlU4VbixI+bpsErwJp+AAuSO2lhSr/XxJl7XbrQ==",
+      "platformPackages": {
+        "x86_64": {
+          "npmPackage": "opencode-linux-x64",
+          "integrity": "sha512-wz+kXi7ZkvLW04hEIocW3RoEznALJ3YGnvNlZdXFarYF0v1jyDyAwpPGZkxb4JZDrw4oy48/LDZ8wCFIQDTxhw==",
+          "binary": "bin/opencode"
+        },
+        "aarch64": {
+          "npmPackage": "opencode-linux-arm64",
+          "integrity": "sha512-Y1HIsJNK+zxbtd54TCrEI/G3m/RSALCaKbzAaaxJYF+ZHQE2PFlHmueqWDigQoT1tbiPi/8tPMirxpGgcXEprg==",
+          "binary": "bin/opencode"
+        }
+      }
+    }
+  },
+  "environment": {
+    "OPENCODE_DISABLE_AUTOUPDATE": "1"
+  }
+}

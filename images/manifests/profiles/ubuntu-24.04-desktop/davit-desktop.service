@@ -1,0 +1,24 @@
+# The VNC desktop of the ubuntu-24.04-desktop profile (G15). It runs as the
+# image user and does not depend on the guest agent: the agent only carries
+# the gateway's loopback TCP stream to x11vnc (tcp.dial, port 5900).
+[Unit]
+Description=davit desktop (Xvfb + Openbox + x11vnc on 127.0.0.1:5900)
+After=network.target
+
+[Service]
+Type=simple
+User=davit
+Environment=DAVIT_DESKTOP_DISPLAY=:1
+Environment=DAVIT_DESKTOP_GEOMETRY=1280x800x24
+Environment=DAVIT_DESKTOP_PORT=5900
+Environment=DAVIT_DESKTOP_BROWSER=1
+ExecStart=/usr/local/libexec/davit-desktop
+Restart=on-failure
+RestartSec=2
+# Nothing here needs privileges.
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

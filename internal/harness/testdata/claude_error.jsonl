@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"/home/user","session_id":"0aa1","tools":[],"model":"claude-sonnet-4-5"}
+{"type":"result","subtype":"success","is_error":true,"duration_ms":300,"num_turns":1,"result":"Invalid API key · Please run /login","session_id":"0aa1","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}

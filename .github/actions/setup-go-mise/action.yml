@@ -1,0 +1,37 @@
+name: Set up Go through mise
+description: >
+  Installs mise and the Go version pinned in mise.toml (the Makefile runs
+  `mise exec -- go`), and restores the Go module and build caches.
+inputs:
+  cache-id:
+    description: Job name for the Go build cache key (jobs compile different package sets and targets).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install mise and Go (mise.toml)
+      uses: jdx/mise-action@v5
+      with:
+        install: true
+        cache: true
+
+    - name: Locate Go caches
+      id: goenv
+      shell: bash
+      run: |
+        mise exec -- go version
+        {
+          echo "modcache=$(mise exec -- go env GOMODCACHE)"
+          echo "buildcache=$(mise exec -- go env GOCACHE)"
+        } >>"$GITHUB_OUTPUT"
+
+    - name: Go module and build cache
+      uses: actions/cache@v6
+      with:
+        path: |
+          ${{ steps.goenv.outputs.modcache }}
+          ${{ steps.goenv.outputs.buildcache }}
+        key: go-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-id }}-${{ hashFiles('go.sum', 'mise.toml') }}
+        restore-keys: |
+          go-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-id }}-
+          go-${{ runner.os }}-${{ runner.arch }}-

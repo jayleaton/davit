@@ -1,0 +1,134 @@
+# The hermetic `make check` gate, one job per stage (Makefile: check-lint plus
+# a full-history secret scan, check-go in two shards, check-cross, check-sdk).
+# No KVM and no guests here; the real-VM tier is .github/workflows/vm-tier.yml,
+# on demand on a self-hosted KVM runner.
+#
+# Kept small for the free Actions minutes: standard ubuntu-latest runners only,
+# pushes to main and pull requests (a branch push without a PR runs nothing),
+# superseded runs cancelled.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Standard ubuntu-latest runners have 4 vCPUs and 16 GiB for public
+  # repositories but 2 vCPUs for private ones; 2 fits both.
+  DAVIT_CHECK_PROCS: 2
+  # Fresh runners have no check stamps; force anyway so a stage always runs.
+  CHECK_FORCE: 1
+
+jobs:
+  lint:
+    name: lint (gofmt, vet, staticcheck, shellcheck, gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Full history for the secret scan.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-go-mise
+        with:
+          cache-id: lint
+      # Pinned ShellCheck (scripts/shellcheck.sh) and the host-built
+      # staticcheck for darwin/arm64 linting.
+      - name: Dev tools cache (.build/tools)
+        uses: actions/cache@v6
+        with:
+          path: .build/tools
+          key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/shellcheck.sh', 'scripts/actionlint.sh', 'scripts/gitleaks.sh', 'go.sum', 'mise.toml') }}
+      - run: make check-lint
+      - name: Secret scan (every commit)
+        run: scripts/gitleaks.sh --history
+
+  go:
+    name: go test (shard ${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-go-mise
+        with:
+          cache-id: test-${{ matrix.shard }}of2
+      - run: make check-go CHECK_SHARD=${{ matrix.shard }}/2
+      - name: Upload check logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: check-logs-go-${{ matrix.shard }}of2
+          path: .build/check-logs/
+          if-no-files-found: ignore
+          # .build/ is a dot directory, which upload-artifact skips by default.
+          include-hidden-files: true
+
+  cross:
+    name: cross (CGO-free linux/amd64, linux/arm64, darwin/arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-go-mise
+        with:
+          cache-id: cross
+      - run: make check-cross
+
+  sdk:
+    name: sdk (Python, TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-go-mise
+        with:
+          cache-id: sdk
+      # requires-python >= 3.10; 3.14 is what the repo-local venv uses locally.
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      # engines.node >= 20, but `node --test` runs the .ts tests directly
+      # (built-in type stripping) and @types/node is 26.x: use Node 26.
+      - name: Set up Node
+        id: node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Python venv cache (.build/py-venv)
+        id: venv-cache
+        uses: actions/cache@v6
+        with:
+          path: .build/py-venv
+          key: py-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('sdk/python/pyproject.toml') }}
+      - name: node_modules cache (sdk/typescript)
+        id: node-modules-cache
+        uses: actions/cache@v6
+        with:
+          path: sdk/typescript/node_modules
+          key: node-modules-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('sdk/typescript/package-lock.json') }}
+      # A restored stamp keeps its old mtime, older than the freshly checked-out
+      # manifest, so make would reinstall (npm ci even deletes node_modules).
+      # On an exact key hit the cache matches the manifest: mark it current.
+      - name: Mark exact cache hits current
+        env:
+          VENV_HIT: ${{ steps.venv-cache.outputs.cache-hit }}
+          NODE_HIT: ${{ steps.node-modules-cache.outputs.cache-hit }}
+        run: |
+          if [ "$VENV_HIT" = true ] && [ -f .build/py-venv/.stamp ]; then touch .build/py-venv/.stamp; fi
+          if [ "$NODE_HIT" = true ] && [ -f sdk/typescript/node_modules/.stamp ]; then touch sdk/typescript/node_modules/.stamp; fi
+      - run: make check-sdk

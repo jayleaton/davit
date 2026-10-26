@@ -1,0 +1,4 @@
+{
+  "harness.claude": {"command": "claude", "npmPackage": "@anthropic-ai/claude-code"},
+  "harness.codex": {"command": "codex", "npmPackage": "@openai/codex"}
+}

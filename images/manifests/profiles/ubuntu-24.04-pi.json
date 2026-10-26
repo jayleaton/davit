@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "kind": "profile",
+  "status": "declared",
+  "name": "ubuntu-24.04-pi",
+  "base": "ubuntu-24.04-base",
+  "arches": ["x86_64", "aarch64"],
+  "description": "base + Node.js (/opt/node) + the pi coding agent CLI (/opt/davit-harness, linked into /usr/local/bin). Not built yet: no kernel, rootfs or recipe digests until images/build.sh produces images/manifests/ubuntu-24.04-pi.json.",
+  "node": "v24.22.1",
+  "capabilities": {
+    "harness.pi": {
+      "command": "pi",
+      "npmPackage": "@earendil-works/pi-coding-agent",
+      "version": "1.4.0",
+      "integrity": "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==",
+      "nodeEngine": ">=22.19.0",
+      "binary": "dist/bundle/cli.js"
+    }
+  },
+  "environment": {
+    "PI_SKIP_VERSION_CHECK": "1",
+    "PI_TELEMETRY": "0"
+  }
+}

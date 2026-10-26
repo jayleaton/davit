@@ -1,0 +1,40 @@
+#!/bin/sh
+# Fake Claude Code for tests: `claude -p --input-format stream-json
+# --output-format stream-json`. Each stdin line is a user message; it
+# answers each with a result line and exits at EOF, like the real CLI.
+# Behaviour keys off the message text.
+session=""
+effort=none
+fast=no
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--resume) session=$2; shift ;;
+	--effort) effort=$2; shift ;;
+	--settings) case "$2" in *'"fastMode":true'*) fast=yes ;; esac; shift ;;
+	esac
+	shift
+done
+resumed=${session:-none}
+[ -n "$session" ] || session="sess-$$"
+echo '{"type":"system","subtype":"init","session_id":"'"$session"'","model":"fake"}'
+n=0
+while IFS= read -r line; do
+	n=$((n + 1))
+	prompt=$(printf '%s' "$line" | sed -n 's/.*"type":"text","text":"\([^"]*\)".*/\1/p')
+	images=$(printf '%s' "$line" | grep -o '"type":"image"' | wc -l | tr -d ' ')
+	case "$prompt" in
+	*slow*) sleep 3 ;;
+	*hang*) sleep 600 ;;
+	*fail*)
+		echo '{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key","session_id":"'"$session"'"}'
+		echo "auth failed" >&2
+		exit 1 ;;
+	*crash*)
+		echo "harness crashed" >&2
+		exit 2 ;;
+	esac
+	printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"echo: '"$prompt"' resumed='"$resumed"' token='"$FAKE_TOKEN"' effort='"$effort"' fast='"$fast"' images='"$images"' msg='"$n"' key='"$ANTHROPIC_API_KEY"' base='"$ANTHROPIC_BASE_URL"'"}]},"session_id":"'"$session"'"}'
+	echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t'"$n"'","name":"Bash","input":{"command":"ls"}}]},"session_id":"'"$session"'"}'
+	echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t'"$n"'","content":"a.txt","is_error":false}]},"session_id":"'"$session"'"}'
+	echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"'"$session"'","total_cost_usd":0.5,"usage":{"input_tokens":3,"output_tokens":4}}'
+done

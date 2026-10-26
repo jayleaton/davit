@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "kind": "profile",
+  "name": "ubuntu-24.04-desktop",
+  "base": "ubuntu-24.04-harness",
+  "status": "declarative: no image is built from this profile yet; images/build.sh does not read profiles/",
+  "description": "A VNC desktop for G15: Xvfb + Openbox + x11vnc on guest loopback, with Chromium. The gateway reaches the VNC server through the guest agent's loopback tunnel (davit desktop open); nothing listens on a guest NIC.",
+  "packages": {
+    "apt": ["xvfb", "openbox", "x11vnc", "xauth", "fonts-dejavu-core", "fonts-noto-color-emoji", "dbus-x11"],
+    "note": "Exact versions are resolved from the pinned Ubuntu snapshot and recorded in the built manifest's rootfs.packages, as for every image."
+  },
+  "inputs": {
+    "chromium": {
+      "source": "Chromium for Testing linux64 tarball (https://googlechromelabs.github.io/chrome-for-testing/), pinned by version and sha256 in images/inputs.lock when the profile is built",
+      "why": "Ubuntu 24.04's chromium-browser deb is a transitional package for the snap, which cannot run in a sealed Firecracker rootfs.",
+      "installTo": "/opt/chromium",
+      "command": "/usr/local/bin/chromium"
+    }
+  },
+  "capabilities": {
+    "desktop.vnc": {
+      "port": 5900,
+      "display": ":1",
+      "geometry": "1280x800x24",
+      "security": "none on 127.0.0.1 only (the gateway authenticates viewers by tailnet identity and enforces view-only)"
+    },
+    "browser.chromium": {
+      "command": "chromium",
+      "profileDir": "/home/davit/.config/chromium",
+      "flags": ["--no-first-run", "--no-default-browser-check", "--password-store=basic"]
+    }
+  },
+  "units": {
+    "davit-desktop.service": {
+      "file": "ubuntu-24.04-desktop/davit-desktop.service",
+      "installTo": "/etc/systemd/system/davit-desktop.service",
+      "enable": true
+    },
+    "davit-desktop": {
+      "file": "ubuntu-24.04-desktop/davit-desktop.sh",
+      "installTo": "/usr/local/libexec/davit-desktop",
+      "mode": "0755"
+    }
+  }
+}

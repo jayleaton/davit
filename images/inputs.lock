@@ -1,0 +1,73 @@
+# Pinned build inputs for the davit guest image pipeline.
+# Shell-sourceable KEY=VALUE (no expansions); scripts/make-manifest.py parses the same lines.
+# Changing any value changes the build; bump deliberately and re-run images/build.sh + smoke.
+
+# Reproducible-build clock: every timestamp in kernel and rootfs is clamped to this.
+SOURCE_DATE_EPOCH=1792454400
+# Ubuntu archive snapshot (https://snapshot.ubuntu.com) used for every apt install; matches SOURCE_DATE_EPOCH.
+UBUNTU_SNAPSHOT=20261020T000000Z
+UBUNTU_SUITE=noble
+
+# ubuntu-base minimal tarball: starting point for both the builder and the guest rootfs.
+UBUNTU_BASE_VERSION=24.04.5
+UBUNTU_BASE_URL_PREFIX=https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release
+UBUNTU_BASE_SHA256_amd64=e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86
+UBUNTU_BASE_SHA256_arm64=a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2
+
+# Guest kernel: Linux LTS source + Firecracker's recommended guest config (same release as FC below).
+KERNEL_VERSION=6.18.58
+KERNEL_URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.58.tar.xz
+KERNEL_SHA256=069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013
+FC_CONFIG_URL_PREFIX=https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.17.0/resources/guest_configs
+FC_CONFIG_SHA256_x86_64=ba22401a0c7292a4c024ebcd10a562d4a1f1bfd2faed671406d3b159c0cf5215
+FC_CONFIG_SHA256_aarch64=35cce8e8b754a84523ca20dc068fc3f8f03a15523be36a8623bad54e11972e2a
+
+# mke2fs built from source inside the builder: >= 1.47.1 clamps every inode time to
+# SOURCE_DATE_EPOCH (Ubuntu 24.04's 1.47.0 copies the build-time ctime, so images never match).
+E2FSPROGS_VERSION=1.47.4
+E2FSPROGS_URL=https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.4/e2fsprogs-1.47.4.tar.xz
+E2FSPROGS_SHA256=fd5bf388cbdbe006a3d3b318d983b2948382440acc85a87f1e7d108653e8db0b
+
+# Docker's kernel requirement checker, run against the kernel config at build time and in the guest by smoke.
+MOBY_CHECK_CONFIG_URL=https://raw.githubusercontent.com/moby/moby/docker-v29.9.2/contrib/check-config.sh
+MOBY_CHECK_CONFIG_SHA256=fda4343e9b50c47896653ca774ccbe9614bfcdb60f080d2b6277baf27efc0a71
+
+# Docker CE apt repository (not snapshotted upstream, so every package version is pinned).
+DOCKER_APT_URL=https://download.docker.com/linux/ubuntu
+DOCKER_GPG_URL=https://download.docker.com/linux/ubuntu/gpg
+DOCKER_GPG_SHA256=1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
+DOCKER_GPG_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+DOCKER_CE_VERSION=5:29.9.2-1~ubuntu.24.04~noble
+CONTAINERD_VERSION=2.4.2-3~ubuntu.24.04~noble
+DOCKER_BUILDX_VERSION=0.38.1-1~ubuntu.24.04~noble
+DOCKER_COMPOSE_VERSION=5.6.1-1~ubuntu.24.04~noble
+
+# Firecracker release used by the smoke test (and whose guest config the kernel starts from).
+FIRECRACKER_VERSION=v1.17.0
+FIRECRACKER_SHA256_x86_64=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+FIRECRACKER_SHA256_aarch64=e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256
+
+# Node.js LTS for the ubuntu-24.04-harness image (official tarball, sha256 from SHASUMS256.txt).
+NODE_VERSION=v24.22.1
+NODE_URL_PREFIX=https://nodejs.org/dist/v24.22.1
+NODE_SHA256_x64=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+NODE_SHA256_arm64=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e
+
+# Developer toolchains for the ubuntu-24.04-dev image (sha256 from each project's release checksums).
+# Go: the version mise.toml pins for this repo (go.dev/dl JSON sha256).
+GO_VERSION=1.26.8
+GO_URL_PREFIX=https://go.dev/dl
+GO_SHA256_amd64=d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b
+GO_SHA256_arm64=211ffced9dcb9633a55eac6364816ec0ddd951389a740e88fa8b3337971bdda0
+# mise (jdx/mise release SHASUMS256.txt): per-project toolchain pins in the guest.
+MISE_VERSION=2026.10.19
+MISE_SHA256_x64=3162760f40b6b5f706c60641e4ef5ee7322bc6c54f72fc26a7111b337aa18d9d
+MISE_SHA256_arm64=4a4ca53b28e5433c527f4f73fac1f98f992a17cf32ca136a58e2e375f790f627
+# pnpm standalone executable (GitHub release asset digests).
+PNPM_VERSION=12.15.0
+PNPM_SHA256_x64=55b5ed0092bd11176c1669598e231ae52e7cedac59de6efd0d415730f37d0598
+PNPM_SHA256_arm64=d7ce93a2c7d847d3a34bd3f559b60c14f578b1320c17cc352a2c5c5fdf956117
+# uv (astral-sh/uv release .sha256 files).
+UV_VERSION=0.13.5
+UV_SHA256_x86_64=f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+UV_SHA256_aarch64=4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403

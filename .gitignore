@@ -1,0 +1,13 @@
+bin/
+*.img
+*.ext4
+/run/
+/.build/
+sdk/typescript/node_modules/
+sdk/typescript/dist/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/results/vm-tier/
+/images/results/

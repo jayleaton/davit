@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"0199b"}
+{"type":"turn.started"}
+{"type":"error","message":"stream disconnected before completion: 401 Unauthorized"}
+{"type":"turn.failed","error":{"message":"401 Unauthorized"}}

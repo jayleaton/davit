@@ -1,0 +1,3 @@
+# x-systemd.growfs: systemd-growfs-root grows the ext4 online at boot to fill a disk larger
+# than the image (davit new --disk); a no-op when it already fills it.
+/dev/vda / ext4 defaults,noatime,errors=remount-ro,x-systemd.growfs 0 1

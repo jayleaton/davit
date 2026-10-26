@@ -1,0 +1,11 @@
+# Image network contract: every VM sits alone in its own host network namespace, so all of
+# them use the same guest address behind a per-namespace TAP (gateway 172.16.0.1).
+[Match]
+Name=eth0
+
+[Network]
+Address=172.16.0.2/24
+Gateway=172.16.0.1
+DNS=1.1.1.1
+LinkLocalAddressing=no
+IPv6AcceptRA=no

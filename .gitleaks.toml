@@ -1,0 +1,29 @@
+# Secret scanning (scripts/gitleaks.sh; make check-lint scans the tree, CI the
+# full history too). gitleaks' default rules plus davit's own token formats.
+# Allowlist only an exact synthetic value in its exact file: never a directory,
+# a whole rule, or a baseline.
+title = "davit secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+description = "Synthetic split-stream redaction fixture (internal/credproxy/host_test.go realKey), exact chunk only"
+condition = "AND"
+paths = ['''(^|/)internal/credproxy/security_test\.go$''']
+regexTarget = "secret"
+regexes = ['''^AL-0123456789$''']
+
+[[rules]]
+id = "davit-token"
+description = "davit API token (slw_) or webhook signing secret (whsec_)"
+regex = '''\b(?:slw_|whsec_)[A-Za-z0-9_-]{32,}'''
+keywords = ["slw_", "whsec_"]
+
+[[rules]]
+id = "tailscale-key"
+description = "Tailscale auth or API key"
+regex = '''\btskey-(?:auth|api)-[A-Za-z0-9_-]{20,}'''
+keywords = ["tskey-"]

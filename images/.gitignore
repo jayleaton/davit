@@ -1,0 +1,10 @@
+# Build scratch and content-addressed outputs: never commit images.
+/.work/
+/out/
+vmlinux
+Image
+*.tar
+*.tar.*
+*.mem
+*.vmstate
+__pycache__/

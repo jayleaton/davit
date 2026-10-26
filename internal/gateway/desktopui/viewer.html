@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en" data-view-only="false">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>davit desktop</title>
+<!--
+  davit built-in desktop viewer (G15). Self-contained: no external URLs,
+  no third-party code. It speaks RFB 3.8 over a WebSocket to the gateway's
+  websockify endpoint, next to this page. The gateway offers security type
+  None only and enforces view-only mode itself; the data-view-only
+  attribute on <html> only hides the input path here.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd;
+    font: 13px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; align-items: center; gap: 12px; padding: 4px 10px;
+    background: #1d1d1d; border-bottom: 1px solid #333; flex: none; }
+  #status { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status[data-state="error"] { color: #ff8a80; }
+  #status[data-state="connected"] { color: #a5d6a7; }
+  #badge { display: none; padding: 1px 6px; border-radius: 3px;
+    background: #5d4037; color: #ffe0b2; font-size: 11px; text-transform: uppercase; }
+  html[data-view-only="true"] #badge { display: inline; }
+  #reconnect { display: none; }
+  #reconnect.show { display: inline-block; }
+  label { user-select: none; }
+  #screen { flex: 1; overflow: auto; display: flex; }
+  #fb { margin: auto; display: block; outline: none; background: #000; }
+  html:not([data-view-only="true"]) #fb { cursor: default; }
+  html:not([data-view-only="true"]) #fb:focus { box-shadow: 0 0 0 1px #4a90e2; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="status" data-state="connecting">connecting…</span>
+  <span id="badge">view only</span>
+  <label><input type="checkbox" id="fit" checked> scale to fit</label>
+  <button type="button" id="reconnect">Reconnect</button>
+</div>
+<div id="screen"><canvas id="fb" width="0" height="0" tabindex="0"></canvas></div>
+<script>
+"use strict";
+(function () {
+  var viewOnly = document.documentElement.getAttribute("data-view-only") === "true";
+  var statusEl = document.getElementById("status");
+  var reconnectBtn = document.getElementById("reconnect");
+  var fitBox = document.getElementById("fit");
+  var screenEl = document.getElementById("screen");
+  var canvas = document.getElementById("fb");
+  var ctx = canvas.getContext("2d", { alpha: false });
+  var utf8 = new TextDecoder("utf-8");
+  var latin1 = new TextDecoder("latin1");
+
+  var MAX_NAME = 1 << 16;      // ServerInit desktop name
+  var MAX_REASON = 1 << 16;    // failure reason strings
+  var MAX_CUT = 1 << 24;       // ServerCutText payload (parsed, then dropped)
+
+  // conn is the current session; handlers of an old socket check it.
+  var conn = null;
+
+  function setStatus(state, text) {
+    statusEl.setAttribute("data-state", state);
+    statusEl.textContent = text;
+    reconnectBtn.classList.toggle("show", state === "error");
+  }
+
+  function connect() {
+    var url = new URL("websockify", location.href);
+    url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    url.hash = "";
+    var c = {
+      ws: null,
+      state: "version",
+      buf: new Uint8Array(64 * 1024), start: 0, end: 0,
+      fbW: 0, fbH: 0, name: "",
+      rectsLeft: 0,
+      failed: false
+    };
+    conn = c;
+    setStatus("connecting", "connecting…");
+    try {
+      c.ws = new WebSocket(url.href, ["binary"]);
+    } catch (e) {
+      fail(c, "cannot open WebSocket: " + e.message);
+      return;
+    }
+    c.ws.binaryType = "arraybuffer";
+    c.ws.onmessage = function (ev) {
+      if (conn !== c || c.failed) return;
+      if (!(ev.data instanceof ArrayBuffer)) {
+        fail(c, "protocol error: unexpected text frame");
+        return;
+      }
+      append(c, new Uint8Array(ev.data));
+      try {
+        while (!c.failed && step(c)) { /* parse as much as is buffered */ }
+      } catch (e) {
+        fail(c, e.message || String(e));
+      }
+    };
+    c.ws.onclose = function (ev) {
+      if (conn !== c || c.failed) return;
+      var why = ev.reason ? ": " + ev.reason : " (code " + ev.code + ")";
+      fail(c, (c.state === "normal" ? "disconnected" : "connection closed during handshake") + why);
+    };
+    c.ws.onerror = function () { /* onclose follows and reports */ };
+  }
+
+  function fail(c, msg) {
+    if (c.failed) return;
+    c.failed = true;
+    releaseAll(c);
+    try { if (c.ws) c.ws.close(); } catch (e) { /* already closed */ }
+    if (conn === c) setStatus("error", "error: " + msg);
+  }
+
+  function send(c, bytes) {
+    if (c.failed || !c.ws || c.ws.readyState !== WebSocket.OPEN) return;
+    c.ws.send(bytes);
+  }
+
+  // ---- receive buffer ----
+
+  function append(c, data) {
+    var have = c.end - c.start;
+    if (c.end + data.length > c.buf.length) {
+      if (have + data.length <= c.buf.length && c.start > 0) {
+        c.buf.copyWithin(0, c.start, c.end);
+      } else {
+        var cap = c.buf.length;
+        while (cap < have + data.length) cap *= 2;
+        var nb = new Uint8Array(cap);
+        nb.set(c.buf.subarray(c.start, c.end));
+        c.buf = nb;
+      }
+      c.start = 0;
+      c.end = have;
+    }
+    c.buf.set(data, c.end);
+    c.end += data.length;
+  }
+  function avail(c) { return c.end - c.start; }
+  function u8(c, o) { return c.buf[c.start + o]; }
+  function u16(c, o) { var p = c.start + o; return (c.buf[p] << 8) | c.buf[p + 1]; }
+  function u32(c, o) { var p = c.start + o;
+    return ((c.buf[p] << 24) >>> 0) + ((c.buf[p + 1] << 16) | (c.buf[p + 2] << 8) | c.buf[p + 3]); }
+  function s32(c, o) { return u32(c, o) | 0; }
+  function bytes(c, o, n) { return c.buf.subarray(c.start + o, c.start + o + n); }
+  function consume(c, n) {
+    c.start += n;
+    if (c.start === c.end) { c.start = 0; c.end = 0; }
+  }
+
+  // A u32 length-prefixed string at offset o: returns [string, totalBytes]
+  // or null if not fully buffered.
+  function lenString(c, o, max, dec) {
+    if (avail(c) < o + 4) return null;
+    var n = u32(c, o);
+    if (n > max) throw new Error("protocol error: string length " + n + " too large");
+    if (avail(c) < o + 4 + n) return null;
+    return [dec.decode(bytes(c, o + 4, n)), o + 4 + n];
+  }
+
+  // ---- parser: step consumes one unit and returns true, or returns false
+  // when more bytes are needed. Errors throw. ----
+
+  function step(c) {
+    switch (c.state) {
+    case "version": {
+      if (avail(c) < 12) return false;
+      var v = latin1.decode(bytes(c, 0, 12));
+      if (v !== "RFB 003.008\n") {
+        throw new Error("unsupported server version " + JSON.stringify(v));
+      }
+      consume(c, 12);
+      send(c, new TextEncoder().encode("RFB 003.008\n"));
+      c.state = "sectypes";
+      return true;
+    }
+    case "sectypes": {
+      if (avail(c) < 1) return false;
+      var n = u8(c, 0);
+      if (n === 0) {
+        var r = lenString(c, 1, MAX_REASON, utf8);
+        if (!r) return false;
+        throw new Error("server refused connection: " + r[0]);
+      }
+      if (avail(c) < 1 + n) return false;
+      var types = Array.prototype.slice.call(bytes(c, 1, n));
+      consume(c, 1 + n);
+      if (types.indexOf(1) < 0) {
+        throw new Error("server offers no supported security type (offered " + types.join(",") + ")");
+      }
+      send(c, new Uint8Array([1]));
+      c.state = "secresult";
+      return true;
+    }
+    case "secresult": {
+      if (avail(c) < 4) return false;
+      var res = u32(c, 0);
+      if (res !== 0) {
+        var rr = lenString(c, 4, MAX_REASON, utf8);
+        if (!rr) return false;
+        throw new Error("security handshake failed: " + (rr[0] || "result " + res));
+      }
+      consume(c, 4);
+      send(c, new Uint8Array([1])); // ClientInit, shared
+      c.state = "serverinit";
+      return true;
+    }
+    case "serverinit": {
+      var nm = lenString(c, 20, MAX_NAME, utf8);
+      if (!nm) return false;
+      c.fbW = u16(c, 0);
+      c.fbH = u16(c, 2);
+      c.name = nm[0];
+      consume(c, nm[1]);
+      c.state = "normal";
+      resizeFb(c, c.fbW, c.fbH);
+      sendSetPixelFormat(c);
+      sendSetEncodings(c);
+      sendUpdateRequest(c, false);
+      setStatus("connected", connectedText(c));
+      attachInput(c);
+      return true;
+    }
+    case "normal":
+      if (c.rectsLeft > 0) return rect(c);
+      return message(c);
+    }
+    throw new Error("internal: bad parser state " + c.state);
+  }
+
+  function message(c) {
+    if (avail(c) < 1) return false;
+    var t = u8(c, 0);
+    switch (t) {
+    case 0: // FramebufferUpdate
+      if (avail(c) < 4) return false;
+      c.rectsLeft = u16(c, 2);
+      consume(c, 4);
+      if (c.rectsLeft === 0) sendUpdateRequest(c, true);
+      return true;
+    case 1: { // SetColourMapEntries: ignored (we ask for true colour)
+      if (avail(c) < 6) return false;
+      var len = 6 + 6 * u16(c, 4);
+      if (avail(c) < len) return false;
+      consume(c, len);
+      return true;
+    }
+    case 2: // Bell
+      consume(c, 1);
+      return true;
+    case 3: { // ServerCutText: parsed and dropped
+      if (avail(c) < 8) return false;
+      var n = u32(c, 4);
+      if (n >= 0x80000000) n = 0x100000000 - n; // extended-clipboard form
+      if (n > MAX_CUT) throw new Error("protocol error: ServerCutText of " + n + " bytes");
+      if (avail(c) < 8 + n) return false;
+      consume(c, 8 + n);
+      return true;
+    }
+    }
+    throw new Error("protocol error: unknown server message type " + t);
+  }
+
+  function rect(c) {
+    if (avail(c) < 12) return false;
+    var x = u16(c, 0), y = u16(c, 2), w = u16(c, 4), h = u16(c, 6);
+    var enc = s32(c, 8);
+    if (enc === 0 || enc === 1) {
+      if (x + w > c.fbW || y + h > c.fbH) {
+        throw new Error("protocol error: rectangle " + w + "x" + h + "+" + x + "+" + y +
+          " outside the " + c.fbW + "x" + c.fbH + " framebuffer");
+      }
+    }
+    switch (enc) {
+    case 0: { // Raw
+      var n = w * h * 4;
+      if (avail(c) < 12 + n) return false;
+      drawRaw(bytes(c, 12, n), x, y, w, h);
+      consume(c, 12 + n);
+      break;
+    }
+    case 1: { // CopyRect
+      if (avail(c) < 16) return false;
+      var sx = u16(c, 12), sy = u16(c, 14);
+      consume(c, 16);
+      if (w > 0 && h > 0) ctx.drawImage(canvas, sx, sy, w, h, x, y, w, h);
+      break;
+    }
+    case -223: // DesktopSize
+      consume(c, 12);
+      resizeFb(c, w, h);
+      setStatus("connected", connectedText(c));
+      break;
+    default:
+      throw new Error("protocol error: unsupported rectangle encoding " + enc);
+    }
+    c.rectsLeft--;
+    if (c.rectsLeft === 0) sendUpdateRequest(c, true);
+    return true;
+  }
+
+  // Pixel format is BGRX in memory (little-endian, R<<16 | G<<8 | B).
+  function drawRaw(src, x, y, w, h) {
+    if (w === 0 || h === 0) return;
+    var img = ctx.createImageData(w, h);
+    var d = img.data;
+    for (var i = 0; i < d.length; i += 4) {
+      d[i] = src[i + 2];
+      d[i + 1] = src[i + 1];
+      d[i + 2] = src[i];
+      d[i + 3] = 255;
+    }
+    ctx.putImageData(img, x, y);
+  }
+
+  function resizeFb(c, w, h) {
+    c.fbW = w;
+    c.fbH = h;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    layout();
+  }
+
+  function connectedText(c) {
+    return "connected" + (c.name ? " — " + c.name : "") + " (" + c.fbW + "×" + c.fbH + ")";
+  }
+
+  // ---- client messages ----
+
+  function sendSetPixelFormat(c) {
+    var b = new Uint8Array(20);
+    b[0] = 0;          // SetPixelFormat
+    b[4] = 32;         // bits per pixel
+    b[5] = 24;         // depth
+    b[6] = 0;          // big-endian: no
+    b[7] = 1;          // true colour
+    b[8] = 0; b[9] = 255;    // red max
+    b[10] = 0; b[11] = 255;  // green max
+    b[12] = 0; b[13] = 255;  // blue max
+    b[14] = 16; b[15] = 8; b[16] = 0; // shifts
+    send(c, b);
+  }
+
+  function sendSetEncodings(c) {
+    var encs = [0, 1, -223];
+    var b = new Uint8Array(4 + 4 * encs.length);
+    var dv = new DataView(b.buffer);
+    b[0] = 2;
+    dv.setUint16(2, encs.length);
+    for (var i = 0; i < encs.length; i++) dv.setInt32(4 + 4 * i, encs[i]);
+    send(c, b);
+  }
+
+  function sendUpdateRequest(c, incremental) {
+    var b = new Uint8Array(10);
+    var dv = new DataView(b.buffer);
+    b[0] = 3;
+    b[1] = incremental ? 1 : 0;
+    dv.setUint16(6, c.fbW);
+    dv.setUint16(8, c.fbH);
+    send(c, b);
+  }
+
+  function sendPointer(c, mask, x, y) {
+    if (viewOnly) return;
+    var b = new Uint8Array(6);
+    var dv = new DataView(b.buffer);
+    b[0] = 5;
+    b[1] = mask;
+    dv.setUint16(2, x);
+    dv.setUint16(4, y);
+    send(c, b);
+  }
+
+  function sendKey(c, down, keysym) {
+    if (viewOnly) return;
+    var b = new Uint8Array(8);
+    var dv = new DataView(b.buffer);
+    b[0] = 4;
+    b[1] = down ? 1 : 0;
+    dv.setUint32(4, keysym >>> 0);
+    send(c, b);
+  }
+
+  // ---- input ----
+
+  var KEYSYMS = {
+    Enter: 0xff0d, Backspace: 0xff08, Tab: 0xff09, Escape: 0xff1b,
+    ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+    Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+    Insert: 0xff63, Delete: 0xffff,
+    F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+    F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7, F11: 0xffc8, F12: 0xffc9,
+    CapsLock: 0xffe5, ContextMenu: 0xff67, AltGraph: 0xfe03
+  };
+  // Modifiers distinguish left and right by KeyboardEvent.code.
+  var MODIFIERS = {
+    ShiftLeft: 0xffe1, ShiftRight: 0xffe2,
+    ControlLeft: 0xffe3, ControlRight: 0xffe4,
+    AltLeft: 0xffe9, AltRight: 0xffea,
+    MetaLeft: 0xffeb, MetaRight: 0xffec, OSLeft: 0xffeb, OSRight: 0xffec
+  };
+  var MODIFIER_KEYS = { Shift: 0xffe1, Control: 0xffe3, Alt: 0xffe9, Meta: 0xffeb, OS: 0xffeb };
+
+  function keysymFor(e) {
+    if (e.key === "AltGraph") return KEYSYMS.AltGraph;
+    if (MODIFIER_KEYS[e.key] !== undefined) {
+      return MODIFIERS[e.code] !== undefined ? MODIFIERS[e.code] : MODIFIER_KEYS[e.key];
+    }
+    if (KEYSYMS[e.key] !== undefined) return KEYSYMS[e.key];
+    var k = e.key;
+    if (typeof k === "string" && k.length > 0) {
+      var cp = k.codePointAt(0);
+      if (k.length === (cp > 0xffff ? 2 : 1)) {
+        if ((cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff)) return cp;
+        if (cp >= 0x100) return 0x01000000 + cp;
+      }
+    }
+    return null; // Dead, Unidentified, Process, unmapped named keys
+  }
+
+  // c.keys maps KeyboardEvent.code to the keysym sent on keydown, so the
+  // release uses the same keysym even if modifiers changed meanwhile.
+  function releaseAll(c) {
+    if (!c.keys) return;
+    var codes = Object.keys(c.keys);
+    for (var i = 0; i < codes.length; i++) sendKey(c, false, c.keys[codes[i]]);
+    c.keys = {};
+    if (c.mask) { sendPointer(c, 0, c.lastX, c.lastY); c.mask = 0; }
+  }
+
+  var detach = null;
+
+  function attachInput(c) {
+    if (detach) { detach(); detach = null; }
+    if (viewOnly) return;
+    c.keys = {};
+    c.mask = 0;
+    c.lastX = 0;
+    c.lastY = 0;
+    c.wheelX = 0;
+    c.wheelY = 0;
+
+    function pos(e) {
+      var r = canvas.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return [0, 0];
+      var x = Math.floor((e.clientX - r.left) * c.fbW / r.width);
+      var y = Math.floor((e.clientY - r.top) * c.fbH / r.height);
+      x = Math.max(0, Math.min(c.fbW - 1, x));
+      y = Math.max(0, Math.min(c.fbH - 1, y));
+      return [x, y];
+    }
+    // DOM buttons: 1 left, 2 right, 4 middle. RFB: 1 left, 2 middle, 4 right.
+    function mask(b) { return (b & 1) | ((b & 4) ? 2 : 0) | ((b & 2) ? 4 : 0); }
+    function pointer(e) {
+      if (conn !== c || c.state !== "normal") return;
+      var p = pos(e);
+      var m = mask(e.buttons);
+      if (e.type === "pointermove" && p[0] === c.lastX && p[1] === c.lastY && m === c.mask) return;
+      c.lastX = p[0];
+      c.lastY = p[1];
+      c.mask = m;
+      sendPointer(c, m, p[0], p[1]);
+    }
+    function down(e) {
+      canvas.focus();
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      e.preventDefault();
+      pointer(e);
+    }
+    function up(e) {
+      e.preventDefault();
+      pointer(e);
+    }
+    function wheel(e) {
+      if (conn !== c || c.state !== "normal") return;
+      e.preventDefault();
+      var scale = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1;
+      c.wheelX += e.deltaX * scale;
+      c.wheelY += e.deltaY * scale;
+      var p = pos(e);
+      c.lastX = p[0];
+      c.lastY = p[1];
+      var STEP = 50;
+      function click(bit) {
+        sendPointer(c, c.mask | bit, p[0], p[1]);
+        sendPointer(c, c.mask, p[0], p[1]);
+      }
+      while (c.wheelY <= -STEP) { click(8); c.wheelY += STEP; }
+      while (c.wheelY >= STEP) { click(16); c.wheelY -= STEP; }
+      while (c.wheelX <= -STEP) { click(32); c.wheelX += STEP; }
+      while (c.wheelX >= STEP) { click(64); c.wheelX -= STEP; }
+    }
+    function keydown(e) {
+      if (conn !== c || c.state !== "normal" || e.isComposing) return;
+      e.preventDefault();
+      var ks = keysymFor(e);
+      if (ks === null) return;
+      var prev = c.keys[e.code];
+      if (prev !== undefined && prev !== ks) sendKey(c, false, prev);
+      c.keys[e.code] = ks;
+      sendKey(c, true, ks);
+    }
+    function keyup(e) {
+      if (conn !== c || c.state !== "normal") return;
+      e.preventDefault();
+      var ks = c.keys[e.code];
+      if (ks === undefined) ks = keysymFor(e);
+      delete c.keys[e.code];
+      if (ks !== null) sendKey(c, false, ks);
+    }
+    function blur() { releaseAll(c); }
+    function nomenu(e) { e.preventDefault(); }
+
+    canvas.addEventListener("pointermove", pointer);
+    canvas.addEventListener("pointerdown", down);
+    canvas.addEventListener("pointerup", up);
+    canvas.addEventListener("wheel", wheel, { passive: false });
+    canvas.addEventListener("keydown", keydown);
+    canvas.addEventListener("keyup", keyup);
+    canvas.addEventListener("blur", blur);
+    canvas.addEventListener("contextmenu", nomenu);
+    detach = function () {
+      canvas.removeEventListener("pointermove", pointer);
+      canvas.removeEventListener("pointerdown", down);
+      canvas.removeEventListener("pointerup", up);
+      canvas.removeEventListener("wheel", wheel);
+      canvas.removeEventListener("keydown", keydown);
+      canvas.removeEventListener("keyup", keyup);
+      canvas.removeEventListener("blur", blur);
+      canvas.removeEventListener("contextmenu", nomenu);
+    };
+  }
+
+  // ---- layout ----
+
+  function layout() {
+    var w = canvas.width, h = canvas.height;
+    if (!w || !h) return;
+    if (fitBox.checked) {
+      var s = Math.min(screenEl.clientWidth / w, screenEl.clientHeight / h);
+      if (!(s > 0)) s = 1;
+      canvas.style.width = Math.floor(w * s) + "px";
+      canvas.style.height = Math.floor(h * s) + "px";
+      canvas.style.imageRendering = s > 1 ? "pixelated" : "auto";
+    } else {
+      canvas.style.imageRendering = "auto";
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+    }
+  }
+
+  fitBox.addEventListener("change", layout);
+  window.addEventListener("resize", layout);
+  reconnectBtn.addEventListener("click", function () {
+    if (detach) { detach(); detach = null; }
+    connect();
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

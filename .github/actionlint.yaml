@@ -1,0 +1,5 @@
+# actionlint configuration.
+self-hosted-runner:
+  # Custom label of the self-hosted runner on the KVM host (workflows/vm-tier.yml).
+  labels:
+    - kvm

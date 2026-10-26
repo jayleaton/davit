@@ -1,0 +1,56 @@
+ip netns exec slw-07534e10c0 nft -f - <<ruleset
+table inet davit_guest {}
+delete table inet davit_guest
+table inet davit_guest {
+	set host4 {
+		type ipv4_addr
+		flags interval
+		auto-merge
+		elements = { 192.168.1.10/32 }
+	}
+	set host6 {
+		type ipv6_addr
+		flags interval
+		auto-merge
+	}
+	set svc4 {
+		type ipv4_addr . inet_proto . inet_service
+		elements = { 192.168.7.20 . tcp . 5432 }
+	}
+	set allow4 {
+		type ipv4_addr
+		flags interval
+		auto-merge
+	}
+	set allow6 {
+		type ipv6_addr
+		flags interval
+		auto-merge
+	}
+	set deny4 {
+		type ipv4_addr
+		flags interval
+		auto-merge
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }
+	}
+	set deny6 {
+		type ipv6_addr
+		flags interval
+		auto-merge
+		elements = { ::/128, ::1/128, ::ffff:0.0.0.0/96, 64:ff9b::/96, 64:ff9b:1::/48, 2001::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 }
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		iifname "tap0" drop
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "tap0" ip saddr { 172.16.0.2, 172.17.0.0/16 } ip daddr 172.16.0.1 tcp dport 15080 accept
+		iifname "tap0" drop
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "up0" ip saddr { 172.16.0.2, 172.17.0.0/16 } masquerade
+	}
+}
+ruleset

@@ -1,0 +1,21 @@
+[Unit]
+Description=Generate this VM's SSH host keys
+# Early like the agent it is ordered before (default dependencies would hold both until
+# basic.target).
+DefaultDependencies=no
+After=local-fs.target
+# Before the agent too: its restore barrier rotates the same key, and racing it would leave
+# ssh-keygen facing an overwrite prompt.
+Before=ssh.service davit-guest-agent.service shutdown.target
+Conflicts=shutdown.target
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ed25519 only, the key type the guest agent manages: sshd can start on a boot the host never
+# runs the restore barrier on (e.g. debugging without the daemon); the barrier rotates it.
+ExecStart=/usr/bin/ssh-keygen -q -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key
+
+[Install]
+WantedBy=ssh.service

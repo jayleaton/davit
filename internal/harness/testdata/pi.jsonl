@@ -1,0 +1,21 @@
+{"type":"session","version":3,"id":"8d0f5a2e-6b1c-4f7e-9a3d-2c4b6e8f0a1b","timestamp":"2026-10-22T12:00:00.000Z","cwd":"/home/davit"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"user","content":"List the files","timestamp":1761130000000}}
+{"type":"message_end","message":{"role":"user","content":"List the files","timestamp":1761130000000}}
+{"type":"message_start","message":{"role":"assistant","content":[],"stopReason":"pending"}}
+{"type":"message_update","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Let me look"}}
+{"type":"message_update","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"call_01","toolName":"bash"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Let me look at the files."},{"type":"toolCall","id":"call_01","name":"bash","arguments":{"command":"ls"}}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","stopReason":"toolUse","usage":{"input":1200,"output":30,"cacheRead":300,"cacheWrite":0,"totalTokens":1530,"cost":{"input":0.0036,"output":0.00045,"cacheRead":0.00009,"cacheWrite":0,"total":0.00414}},"timestamp":1761130000500}}
+{"type":"tool_execution_start","toolCallId":"call_01","toolName":"bash","args":{"command":"ls"}}
+{"type":"tool_execution_update","toolCallId":"call_01","toolName":"bash","args":{"command":"ls"},"partialResult":{"content":[{"type":"text","text":"README.md\n"}],"details":{}}}
+{"type":"tool_execution_end","toolCallId":"call_01","toolName":"bash","result":{"content":[{"type":"text","text":"README.md\nmain.go\n"}],"details":{}},"isError":false,"durationMs":12}
+{"type":"tool_execution_start","toolCallId":"call_02","toolName":"read","args":{"path":"/nope"}}
+{"type":"tool_execution_end","toolCallId":"call_02","toolName":"read","result":{"content":[{"type":"text","text":"ENOENT: /nope"}],"details":{}},"isError":true,"durationMs":1}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"toolUse"},"toolResults":[]}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"assistant","content":[],"stopReason":"pending"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Two files."},{"type":"text","text":"There are two files: README.md and main.go."}],"stopReason":"stop","usage":{"input":1300,"output":12,"cacheRead":1200,"cacheWrite":0,"totalTokens":2512,"cost":{"input":0.0039,"output":0.00018,"cacheRead":0.00036,"cacheWrite":0,"total":0.00444}},"timestamp":1761130001500}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"stop"},"toolResults":[]}
+{"type":"agent_end","messages":[],"willRetry":false}
+{"type":"agent_settled","aborted":false}

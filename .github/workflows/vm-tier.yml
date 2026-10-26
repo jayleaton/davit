@@ -1,0 +1,68 @@
+# The real-VM test tier (DAVIT_TEST_FIRECRACKER=1; docs/vm-tier.md), on
+# demand only. It runs on a self-hosted runner on the KVM host itself and
+# drives `make vm-tier` (scripts/host-tier.sh), which SSHes to
+# vars.VM_TIER_HOST (default localhost): the runner user needs non-interactive
+# key auth to that destination.
+name: vm-tier
+
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: go test -run regex
+        type: string
+        default: '.'
+      bench:
+        description: Also run benchmarks (DAVIT_BENCH=1)
+        type: boolean
+        default: false
+      fresh_host:
+        description: Also run scripts/fresh-host-e2e.sh on real Firecracker
+        type: boolean
+        default: false
+      rebuild_images:
+        description: Rebuild the guest images first
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One real-VM run at a time; never cancel one midway (the host cleanup must run).
+concurrency:
+  group: vm-tier
+  cancel-in-progress: false
+
+jobs:
+  vm-tier:
+    name: vm-tier (${{ inputs.tests }})
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      # Inputs reach the shell only as environment variables, never
+      # interpolated into the script.
+      - name: Run the real-VM tier
+        env:
+          HOST: ${{ vars.VM_TIER_HOST || 'localhost' }}
+          TESTS: ${{ inputs.tests }}
+          BENCH: ${{ inputs.bench }}
+          FRESH_HOST: ${{ inputs.fresh_host }}
+          REBUILD_IMAGES: ${{ inputs.rebuild_images }}
+        run: |
+          flags=()
+          [ "$BENCH" = true ] && flags+=(--bench)
+          [ "$FRESH_HOST" = true ] && flags+=(--fresh-host)
+          [ "$REBUILD_IMAGES" = true ] && flags+=(--rebuild-images)
+          echo "host=$HOST tests=$TESTS flags=${flags[*]}"
+          # TESTS through the environment: make would expand `$` in an argument.
+          TESTS="${TESTS:-.}" make vm-tier HOST="$HOST" VM_TIER_FLAGS="${flags[*]}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-tier-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/vm-tier/
+          if-no-files-found: warn

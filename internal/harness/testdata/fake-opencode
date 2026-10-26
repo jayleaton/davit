@@ -1,0 +1,30 @@
+#!/bin/sh
+# Fake OpenCode for tests: emits `opencode run --format json` lines.
+# `--session SESSION` resumes SESSION; the prompt is on stdin. It echoes
+# the variant, --file paths, provider key and OPENCODE_CONFIG_CONTENT.
+prompt=$(tr '\n' ' ')
+session=""
+variant=none
+files=""
+prev=""
+for a in "$@"; do
+	case "$prev" in
+	--session) session=$a ;;
+	--variant) variant=$a ;;
+	--file) files="$files $a" ;;
+	esac
+	prev=$a
+done
+resumed=${session:-none}
+[ -n "$session" ] || session="ses_$$"
+line() { printf '%s\n' '{"type":"'"$1"'","timestamp":1,"sessionID":"'"$session"'",'"$2"'}'; }
+line step_start '"part":{"type":"step-start"}'
+case "$prompt" in
+*slow*) sleep 3 ;;
+*fail*)
+	line error '"error":{"name":"ProviderAuthError","data":{"providerID":"anthropic","message":"invalid x-api-key"}}'
+	exit 1 ;;
+esac
+line tool_use '"part":{"type":"tool","callID":"c1","tool":"bash","state":{"status":"completed","input":{"command":"ls"},"output":"a.txt\n"}}'
+line text '"part":{"type":"text","text":"echo: '"$prompt"' resumed='"$resumed"' effort='"$variant"' images='"${files# }"' key='"$ANTHROPIC_API_KEY"' config='"$(printf '%s' "$OPENCODE_CONFIG_CONTENT" | sed 's/"/\\"/g')"'"}'
+line step_finish '"part":{"type":"step-finish","reason":"stop","cost":0.001,"tokens":{"input":10,"output":5,"cache":{"read":2,"write":0}}}'

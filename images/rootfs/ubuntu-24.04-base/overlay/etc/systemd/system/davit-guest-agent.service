@@ -1,0 +1,21 @@
+# The davit guest agent (internal/guestagent): the static davit binary, which acts as the agent
+# when invoked as davit-guest-agent (cmd/davit dispatches on argv[0]; arguments are agent
+# flags). Listens on AF_VSOCK port 1024 for the host (CID 2). Starts early, before sshd, so the
+# restore barrier can gate identity-dependent services. Runs as root: the barrier sets the clock,
+# hostname, machine-id and SSH host keys, and exec/file RPCs switch to the requested user.
+# Unit from internal/guestagent/doc.go, plus -default-user and explicit shutdown ordering (with
+# DefaultDependencies=no nothing else stops it before the root filesystem is remounted read-only).
+[Unit]
+Description=davit guest agent
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+ExecStart=/usr/local/bin/davit-guest-agent -default-user davit
+Restart=always
+RestartSec=100ms
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,179 @@
+# Release: on a pushed `v*` tag, build the guest images (kernel, guest agent,
+# rootfs for ubuntu-24.04-base and ubuntu-24.04-dev; images/build.sh) on a
+# standard x86_64 runner, pack the release with `make release`
+# (packaging/release.sh: host binaries, image bundles, install.sh, release.json,
+# SHA256SUMS) and publish it as a GitHub release (a prerelease when the tag
+# contains '-'). workflow_dispatch builds everything and uploads it as a
+# workflow artifact, but publishes nothing.
+#
+# Trust policy (docs/install-host.md#trust): SHA256SUMS for integrity, GitHub
+# build-provenance attestations for authenticity. GitHub offers attestations
+# on private repositories only with Enterprise Cloud, so a release from a
+# private repository is published without them.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release per ref at a time; never cancel one midway.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (images + make release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    env:
+      IMAGES: ubuntu-24.04-base ubuntu-24.04-dev
+    steps:
+      # release.sh and build-agent.sh stamp `git describe --tags`: full history and tags.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-go-mise
+        with:
+          cache-id: release
+
+      # Everything the image build writes lives outside the checkout:
+      # release.sh refuses a dirty tree, and build.sh would otherwise
+      # overwrite the committed manifests. (The runner context is not
+      # available in job-level env.)
+      - name: Image build directories outside the checkout
+        run: |
+          {
+            echo "DAVIT_IMAGES_WORK=$RUNNER_TEMP/images-work"
+            echo "DAVIT_IMAGES_OUT=$RUNNER_TEMP/images-out"
+            echo "DAVIT_MANIFESTS=$RUNNER_TEMP/manifests"
+          } >>"$GITHUB_ENV"
+
+      # Two sparse 4 GiB rootfs images, the kernel tree and the builder chroot
+      # do not fit next to the preinstalled toolchains this job never uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      # images/README.md "Root requirements": unprivileged user namespaces
+      # with a subuid/subgid range (newuidmap/newgidmap from uidmap). Ubuntu
+      # 24.04 restricts unprivileged userns through AppArmor; relaxing it is
+      # an admin decision the scripts never make, fine on an ephemeral runner.
+      - name: Host setup for the rootless image build
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends uidmap util-linux curl tar xz-utils gzip zstd gnupg python3 git
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          user=$(id -un)
+          # A range above every allocated one, so it overlaps no other user's.
+          lo=$(cat /etc/subuid /etc/subgid 2>/dev/null | awk -F: 'BEGIN {m = 100000} $2 + $3 > m {m = $2 + $3} END {print m}')
+          for f in /etc/subuid /etc/subgid; do
+            if ! grep -q "^$user:" "$f" 2>/dev/null; then
+              echo "$user:$lo:65536" | sudo tee -a "$f" >/dev/null
+            fi
+          done
+          grep "^$user:" /etc/subuid /etc/subgid
+          unshare --map-auto --map-root-user -- id
+
+      - name: Build guest images
+        run: |
+          JOBS=$(nproc) images/build.sh
+          ls -lsh "$DAVIT_IMAGES_OUT/blobs/sha256" "$DAVIT_MANIFESTS"
+          df -h /
+
+      - name: make release
+        id: release
+        env:
+          RELEASE_IMAGES: ubuntu-24.04-base,ubuntu-24.04-dev
+        run: |
+          # The image build must have left the tree as checked out.
+          if [ -n "$(git status --porcelain)" ]; then git status --porcelain; exit 1; fi
+          make release
+          version=$(cat .build/release/latest)
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          # Out of the dot directory, which upload-artifact skips by default.
+          mv ".build/release/$version" "$RUNNER_TEMP/dist"
+          ls -l "$RUNNER_TEMP/dist"
+          cat "$RUNNER_TEMP/dist/SHA256SUMS"
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ steps.release.outputs.version }}
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          # The bundles are zstd and the binaries gzip already.
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v7
+        with:
+          name: release-${{ needs.build.outputs.version }}
+          path: dist
+
+      # Provenance for every asset: `gh attestation verify FILE --repo OWNER/REPO`.
+      - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      # Refs and outputs reach the shell only through the environment.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PRIVATE: ${{ github.event.repository.private }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          # release.sh names the release after `git describe`, so on a tag
+          # build it must be the tag itself.
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "release version $VERSION is not the tag $TAG" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum -c SHA256SUMS)
+          {
+            echo "Install on the Linux host that runs the VMs, then on your laptop:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | sh -s -- --host"
+            echo "curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | sh -s -- --client"
+            echo '```'
+            echo
+            if [ "$PRIVATE" != true ]; then
+              echo "Every asset has a build-provenance attestation: gh attestation verify FILE --repo $REPO"
+              echo
+            fi
+            echo "SHA256SUMS:"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >"$RUNNER_TEMP/notes.md"
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* --repo "$REPO" --verify-tag \
+            --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"

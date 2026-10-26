@@ -1,0 +1,48 @@
+sysctl -q -w net.ipv4.ip_forward=1
+nft -f - <<ruleset
+add table inet davit
+add set inet davit vm_src { type ifname . ipv4_addr; }
+add set inet davit svc4 { type ipv4_addr . inet_proto . inet_service; }
+flush set inet davit svc4
+add element inet davit svc4 { 192.168.7.20 . tcp . 5432 }
+add set inet davit host4 { type ipv4_addr; flags interval; auto-merge; }
+flush set inet davit host4
+add element inet davit host4 { 192.168.1.10/32 }
+add set inet davit host6 { type ipv6_addr; flags interval; auto-merge; }
+flush set inet davit host6
+add set inet davit allow4 { type ipv4_addr; flags interval; auto-merge; }
+flush set inet davit allow4
+add set inet davit allow6 { type ipv6_addr; flags interval; auto-merge; }
+flush set inet davit allow6
+add set inet davit deny4 { type ipv4_addr; flags interval; auto-merge; }
+flush set inet davit deny4
+add element inet davit deny4 { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4, 10.200.0.0/16 }
+add set inet davit deny6 { type ipv6_addr; flags interval; auto-merge; }
+flush set inet davit deny6
+add element inet davit deny6 { ::/128, ::1/128, ::ffff:0.0.0.0/96, 64:ff9b::/96, 64:ff9b:1::/48, 2001::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 }
+add chain inet davit vm_out
+flush chain inet davit vm_out
+add rule inet davit vm_out ct state established,related accept
+add rule inet davit vm_out ct state invalid drop
+add rule inet davit vm_out iifname . ip saddr != @vm_src drop
+add rule inet davit vm_out oifname != "eth0" drop
+add rule inet davit vm_out ip daddr @host4 drop
+add rule inet davit vm_out ip6 daddr @host6 drop
+add rule inet davit vm_out ip daddr . meta l4proto . th dport @svc4 accept
+add rule inet davit vm_out ip daddr @allow4 accept
+add rule inet davit vm_out ip6 daddr @allow6 accept
+add rule inet davit vm_out ip daddr @deny4 drop
+add rule inet davit vm_out ip6 daddr @deny6 drop
+add rule inet davit vm_out accept
+add chain inet davit forward { type filter hook forward priority filter; policy accept; }
+flush chain inet davit forward
+add rule inet davit forward iifname "slw*" jump vm_out
+add rule inet davit forward oifname "slw*" ct state established,related accept
+add rule inet davit forward oifname "slw*" drop
+add chain inet davit input { type filter hook input priority filter; policy accept; }
+flush chain inet davit input
+add rule inet davit input iifname "slw*" drop
+add chain inet davit postrouting { type nat hook postrouting priority srcnat; policy accept; }
+flush chain inet davit postrouting
+add rule inet davit postrouting oifname "eth0" ip saddr 10.200.0.0/16 masquerade
+ruleset

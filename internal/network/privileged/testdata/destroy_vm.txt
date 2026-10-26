@@ -1,0 +1,5 @@
+nft -f - <<ruleset  # ignore error
+delete element inet davit vm_src { "slw07534e10c0h" . 10.200.0.6 }
+ruleset
+ip netns del slw-07534e10c0  # ignore error
+ip link del dev slw07534e10c0h  # ignore error

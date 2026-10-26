@@ -1,0 +1,34 @@
+#!/bin/sh
+# Fake pi for tests: emits `pi --mode json` lines. `--session-id SESSION`
+# opens SESSION; the prompt is on stdin. It echoes the thinking level,
+# @image arguments and the provider key. A model error exits 0, as pi does.
+prompt=$(tr '\n' ' ')
+session=""
+thinking=none
+images=""
+prev=""
+for a in "$@"; do
+	case "$prev" in
+	--session-id) session=$a ;;
+	--thinking) thinking=$a ;;
+	esac
+	case "$a" in
+	@*) images="$images ${a#@}" ;;
+	esac
+	prev=$a
+done
+resumed=${session:-none}
+[ -n "$session" ] || session="pi-$$"
+echo '{"type":"session","version":3,"id":"'"$session"'","timestamp":"2026-10-22T12:00:00.000Z","cwd":"'"$PWD"'"}'
+echo '{"type":"agent_start"}'
+case "$prompt" in
+*slow*) sleep 3 ;;
+*fail*)
+	echo '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"invalid x-api-key"}}'
+	echo '{"type":"agent_settled","aborted":false}'
+	exit 0 ;;
+esac
+echo '{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"ls"}}'
+printf '%s\n' '{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"a.txt\n"}]},"isError":false}'
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"echo: '"$prompt"' resumed='"$resumed"' effort='"$thinking"' images='"${images# }"' key='"$ANTHROPIC_API_KEY"'"}],"stopReason":"stop","usage":{"input":10,"output":5,"cacheRead":2,"cost":{"total":0.001}}}}'
+echo '{"type":"agent_settled","aborted":false}'

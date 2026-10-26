@@ -1,0 +1,15 @@
+# Extra Ubuntu packages for ubuntu-24.04-dev, on top of ubuntu-24.04-base (which already has
+# git, build-essential, python3, curl and Docker CE). From the pinned snapshot, --no-install-recommends.
+pkg-config
+libssl-dev
+zlib1g-dev
+libffi-dev
+python3-venv
+python3-dev
+unzip
+zip
+xz-utils
+jq
+ripgrep
+sqlite3
+make

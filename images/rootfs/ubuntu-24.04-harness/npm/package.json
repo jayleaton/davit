@@ -1,0 +1,9 @@
+{
+  "name": "davit-harness",
+  "private": true,
+  "description": "Coding-agent CLIs baked into the ubuntu-24.04-harness image (exact versions; integrity pinned by package-lock.json).",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.308",
+    "@openai/codex": "0.163.0"
+  }
+}

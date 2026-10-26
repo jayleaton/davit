@@ -1,0 +1,37 @@
+# Ubuntu packages for ubuntu-24.04-base (versions come from the pinned snapshot in inputs.lock).
+# Installed with --no-install-recommends. Docker CE packages are pinned separately in inputs.lock.
+# boot / init
+systemd
+systemd-sysv
+systemd-resolved
+udev
+dbus
+kmod
+e2fsprogs
+# access
+openssh-server
+openssh-client
+sudo
+# networking (iptables defaults to the nft backend; nftables CLI for inspection)
+iproute2
+iptables
+nftables
+iputils-ping
+ca-certificates
+curl
+wget
+socat
+# developer baseline
+git
+build-essential
+python3
+gnupg
+jq
+less
+vim-tiny
+xz-utils
+zstd
+unzip
+tzdata
+# static busybox: smoke builds an offline docker image from it
+busybox-static

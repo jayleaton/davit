@@ -1,0 +1,23 @@
+{
+  "toolchain.go": {
+    "command": "go",
+    "versionVar": "GO_VERSION",
+    "versionFormat": "go{}"
+  },
+  "toolchain.node": {
+    "command": "node",
+    "versionVar": "NODE_VERSION"
+  },
+  "toolchain.pnpm": {
+    "command": "pnpm",
+    "versionVar": "PNPM_VERSION"
+  },
+  "toolchain.uv": {
+    "command": "uv",
+    "versionVar": "UV_VERSION"
+  },
+  "toolchain.mise": {
+    "command": "mise",
+    "versionVar": "MISE_VERSION"
+  }
+}
