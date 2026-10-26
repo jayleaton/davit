@@ -24,7 +24,7 @@ type boxSub struct {
 var boxSubs = []boxSub{
 	{"run", "[PROJECT[/INSTANCE]] [flags] -- COMMAND...", "sync this worktree into its box, run COMMAND there, stream its output; exits with COMMAND's status",
 		[]string{"cwd", "env", "e", "timeout", "stdin", "user", "raw", "no-sync", "no-up", "git", "wait", "image", "type", "cpus", "memory", "disk", "idle"}},
-	{"up", "[PROJECT[/INSTANCE]] [flags]", "create or start the box (the first time, the project image is built: dependencies installed once)",
+	{"up", "[PROJECT[/INSTANCE]] [flags]", "create or start the box (the first time, the project image is built: dependencies installed once); --cpus/--memory/--disk resize it",
 		[]string{"refresh", "image", "type", "cpus", "memory", "disk", "idle", "wait", "no-wait", "wait-timeout", "idempotency-key"}},
 	{"down", "[PROJECT[/INSTANCE]] [--force]", "stop the box; its disk is kept (it also stops by itself after 15 min unused)",
 		[]string{"force", "no-wait", "wait-timeout", "idempotency-key"}},

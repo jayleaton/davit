@@ -3400,7 +3400,8 @@ components:
         request waits up to this many seconds in a FIFO queue (`HostCapacity.waiting`), and
         answers once admitted, or `resource_exhausted` (details `waitedSeconds`) when the wait
         ends. While anyone waits, a request without a wait fails at once (details `resource:
-        queue`, `waiting`). Omitted or 0: no wait.
+        queue`, `waiting`); a resumeVM of a ready or running VM needs no room and never queues.
+        Omitted or 0: no wait.
       schema:
         type: integer
         format: int64

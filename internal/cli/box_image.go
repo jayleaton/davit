@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -170,11 +172,11 @@ func (s *session) buildImage(ctx context.Context, o *opts, project string, build
 		}
 		no := false
 		create = func() (*api.CreateVMRequest, error) {
-			return &api.CreateVMRequest{Name: builder, Image: o.image, Type: o.typ, Shape: o.shape(), AutoStop: &no,
+			return &api.CreateVMRequest{Name: builder, Image: o.image, Type: o.typ, Shape: s.newBoxShape(ctx, o, tree.dir), AutoStop: &no,
 				IdleTimeoutSeconds: int64(idle / time.Second), Labels: map[string]string{domain.LabelBox: project, labelBoxRole: boxRoleImage}}, nil
 		}
 	}
-	vm, _, _, err := s.ensureRunning(ctx, o, builder, project, create)
+	vm, _, err := s.ensureRunning(ctx, o, builder, project, create)
 	if err != nil {
 		return err
 	}
@@ -200,6 +202,12 @@ func (s *session) buildImage(ctx context.Context, o *opts, project string, build
 		return err
 	}
 	setupSecs := time.Since(setupStart).Seconds()
+	if jsProject(tree.dir) {
+		p, err := s.boxExecQuiet(ctx, builder, []string{"sh", "-c", installProfile, "profile", nodeBinProfile(tree.guest)}, "/", time.Minute)
+		if code := processExit(p); err != nil || code != 0 {
+			s.out.diag("box %s image: node_modules/.bin not put on the login PATH (exit %d): %v", project, code, err)
+		}
+	}
 	if err := s.stopBox(ctx, o, builder); err != nil {
 		return err
 	}
@@ -307,7 +315,29 @@ func detectSetup(dir string) (string, []string) {
 		step("go mod download", run+"go mod download")
 	}
 	if has("package.json") {
+		locked := has("pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "bun.lock", "bun.lockb")
 		switch {
+		case vitePlus(dir):
+			// Vite+ (https://viteplus.dev): its documented bootstrap, the
+			// global vp CLI (unless the image or the project's mise pins
+			// have one), then `vp install`, which installs with the package
+			// manager and version packageManager pins. The installer puts
+			// its bin dir on PATH in ~/.profile and ~/.bashrc; it manages
+			// Node.js only where neither the image nor mise has one. CI
+			// keeps it off the terminal.
+			install := "vp install"
+			if locked {
+				install += " --frozen-lockfile"
+			}
+			step("vp install",
+				"if ! "+run+"vp --version >/dev/null 2>&1; then",
+				`  export VP_BIN_DIR="$HOME/.local/share/vite-plus/bin" VP_DATA_DIR="$HOME/.local/share/vite-plus" VP_CACHE_DIR="$HOME/.cache/vite-plus"`,
+				"  if "+run+"node --version >/dev/null 2>&1; then vp_node=no; else vp_node=yes; fi",
+				`  vp_installer=$(mktemp) && curl -fsSL https://vite.plus -o "$vp_installer"`,
+				`  CI=1 VP_NODE_MANAGER=$vp_node bash "$vp_installer" </dev/null && rm -f "$vp_installer"`,
+				`  export PATH="$VP_BIN_DIR:$PATH"`,
+				"fi",
+				run+install)
 		case has("pnpm-lock.yaml"):
 			step("pnpm install", run+"pnpm install --frozen-lockfile")
 		case has("package-lock.json", "npm-shrinkwrap.json"):
@@ -338,6 +368,94 @@ func detectSetup(dir string) (string, []string) {
 	}
 	return strings.Join(lines, "\n") + "\n", found
 }
+
+// jsProject reports whether dir, a tree's top level, is a JavaScript
+// project: it has a package.json.
+func jsProject(dir string) bool { return dir != "" && exists(filepath.Join(dir, "package.json")) }
+
+// vitePlus reports whether the JS project in dir uses Vite+: vite-plus is
+// in its package.json dependencies or devDependencies, or its vite config
+// imports vite-plus.
+func vitePlus(dir string) bool {
+	if b, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pkg struct {
+			Dependencies    map[string]any `json:"dependencies"`
+			DevDependencies map[string]any `json:"devDependencies"`
+		}
+		if json.Unmarshal(b, &pkg) == nil && (pkg.Dependencies["vite-plus"] != nil || pkg.DevDependencies["vite-plus"] != nil) {
+			return true
+		}
+	}
+	for _, ext := range []string{"ts", "mts", "cts", "js", "mjs", "cjs"} {
+		if b, err := os.ReadFile(filepath.Join(dir, "vite.config."+ext)); err == nil &&
+			(strings.Contains(string(b), `"vite-plus`) || strings.Contains(string(b), `'vite-plus`)) {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultJSBoxMemory is the memory a new box (builder or instance) of a JS
+// project gets when neither --memory nor --type says: package installs,
+// type checks and linters of a JS workspace outgrow the host default
+// (domain.DefaultShape, 2 GiB).
+const DefaultJSBoxMemory = 4 * domain.GiB
+
+// newBoxShape is the shape override of a new box whose tree is dir:
+// --cpus/--memory/--disk, with DefaultJSBoxMemory for a JS project unless
+// --memory or --type is given. A host that can never hold that much (the
+// engine's largest VM, limits.memoryBytes or the memory reservation budget
+// below it) keeps its default; a full one queues the box (--wait) like any
+// other.
+func (s *session) newBoxShape(ctx context.Context, o *opts, dir string) *api.ShapeOverride {
+	shape := o.shape()
+	if o.memory.v != 0 || o.typ != "" || !jsProject(dir) {
+		return shape
+	}
+	var caps api.HostCapabilities
+	if err := s.cl.get(ctx, "/capabilities", nil, &caps); err == nil {
+		bounds := []int64{caps.Runtime.Shape.MaxMemoryBytes}
+		if c := caps.Capacity; c != nil {
+			bounds = append(bounds, c.Limits.MemoryBytes, c.MemoryBudgetBytes)
+		}
+		for _, b := range bounds {
+			if b > 0 && b < DefaultJSBoxMemory {
+				s.out.diag("box: the host holds at most %s per VM, below the %s of a JS project box: keeping the host default (--memory sets it)",
+					humanBytes(b), humanBytes(DefaultJSBoxMemory))
+				return shape
+			}
+		}
+	}
+	if shape == nil {
+		shape = &api.ShapeOverride{}
+	}
+	shape.MemoryBytes = DefaultJSBoxMemory
+	return shape
+}
+
+// nodeBinProfile is the login profile snippet that puts the JS project's
+// node_modules/.bin in guest directory tree on PATH, for `box ssh` (`box
+// run` also puts every one from its directory up first, boxRunPrelude).
+// POSIX sh: a login /bin/sh may be dash.
+func nodeBinProfile(tree string) string {
+	return "# davit: this project's node_modules/.bin on PATH in login shells (box ssh, box run)\n" +
+		"davit_node_bin=" + sshRemoteQuote(path.Join(tree, "node_modules/.bin")) + "\n" +
+		`case ":$PATH:" in *":$davit_node_bin:"*) ;; *) PATH="$davit_node_bin:$PATH"; export PATH ;; esac` + "\n" +
+		"unset davit_node_bin\n"
+}
+
+// installProfile writes profile snippet $1 where every login shell of the
+// image user reads it: /etc/profile.d when the user has sudo, else a file
+// ~/.profile sources.
+const installProfile = `set -eu
+if sudo -n true 2>/dev/null; then
+  printf '%s' "$1" | sudo tee /etc/profile.d/davit-node-bin.sh >/dev/null
+else
+  mkdir -p "$HOME/.config/davit"
+  printf '%s' "$1" >"$HOME/.config/davit/node-bin.sh"
+  grep -qs 'davit/node-bin.sh' "$HOME/.profile" || printf '%s\n' '. "$HOME/.config/davit/node-bin.sh"' >>"$HOME/.profile"
+fi
+`
 
 // makeTarget reports whether a Makefile defines target.
 func makeTarget(makefile, target string) bool {

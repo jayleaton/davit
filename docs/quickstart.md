@@ -134,11 +134,13 @@ davit box run -- make test
    | --- | --- |
    | `mise.toml`, `.mise.toml` or `.tool-versions` | `mise install` (later steps then run with the pinned tools) |
    | `go.mod` | `go mod download` |
-   | `package.json` | `pnpm install`, `npm ci`, `yarn install` or `bun install`, by lockfile (`npm install` without one) |
+   | `package.json` | `pnpm install`, `npm ci`, `yarn install` or `bun install`, by lockfile (`npm install` without one); a [Vite+](https://viteplus.dev) project gets vp and `vp install`, with the package manager `packageManager` pins |
    | `uv.lock`, `pyproject.toml` or `requirements.txt` | `uv sync`, or a `.venv` with `uv pip install -r` |
    | a Makefile with a `setup` target | `make setup` |
 
-   The result is saved as the project image, which every later run starts from.
+   The result is saved as the project image, which every later run starts from. A JS project's VMs get 4 GiB
+   memory instead of 2 GiB (`--memory` sets another), and its `node_modules/.bin` is on PATH, so `vp` or
+   `tsc` run as they are.
 2. **Your VM.** This git worktree gets its own persistent VM, made from the project image. Another worktree of
    the same repository gets its own VM from the same image.
 3. **Sync.** Before each run, the worktree's files are copied in: tracked files, and untracked files that are

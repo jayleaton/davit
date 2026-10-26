@@ -45,7 +45,7 @@ version of these steps is [docs/quickstart.md](docs/quickstart.md).
 
 ## How it works
 
-- **Project image:** the dependencies are installed once, from `.davit/setup.sh` or a setup detected from the repo (mise, `go.mod`, lockfiles, a `setup` target), and kept as numbered versions.
+- **Project image:** the dependencies are installed once, from `.davit/setup.sh` or a setup detected from the repo (mise, `go.mod`, lockfiles, Vite+, a `setup` target), and kept as numbered versions. A JS project's VMs get 4 GiB memory and its `node_modules/.bin` on PATH.
 - **One VM per worktree:** each git worktree gets its own persistent instance made from the project image.
 - **Sync:** the worktree is copied in before each run, and `davit box sync --pull PATH` brings files back. Sync adds and updates files; a file deleted locally stays in the box.
 - **Output:** stdout and stderr stream to your terminal, and davit exits with the command's exit code. An idle VM stops itself after 15 minutes.

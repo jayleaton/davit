@@ -1,11 +1,21 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"davit/api"
+	"davit/internal/domain"
 )
 
 func TestBoxName(t *testing.T) {
@@ -88,6 +98,137 @@ func TestDetectSetup(t *testing.T) {
 	}
 	if makeTarget("setup-deps:\n", "setup") || makeTarget("\tsetup: x\n", "setup") || makeTarget("setup := 1\n", "setup") {
 		t.Fatal("makeTarget matched a non-target")
+	}
+}
+
+// TestDetectVitePlus: a Vite+ project (vite-plus in package.json, or a vite
+// config importing it) installs through vp, with the lockfile frozen; other
+// JS projects keep their package manager's step.
+func TestDetectVitePlus(t *testing.T) {
+	for name, files := range map[string]map[string]string{
+		"devDependency": {"package.json": `{"devDependencies":{"vite-plus":"catalog:"},"packageManager":"pnpm@11.10.0"}`, "pnpm-lock.yaml": ""},
+		"dependency":    {"package.json": `{"dependencies":{"vite-plus":"1.0.0"}}`},
+		"config":        {"package.json": `{}`, "vite.config.ts": `import { defineConfig } from "vite-plus";`, "yarn.lock": ""},
+	} {
+		dir := t.TempDir()
+		for f, data := range files {
+			os.WriteFile(filepath.Join(dir, f), []byte(data), 0o644)
+		}
+		script, found := detectSetup(dir)
+		if !slices.Equal(found, []string{"vp install"}) || !jsProject(dir) {
+			t.Fatalf("%s: found %v", name, found)
+		}
+		_, locked := files["pnpm-lock.yaml"]
+		_, yarn := files["yarn.lock"]
+		if frozen := strings.Contains(script, "vp install --frozen-lockfile"); frozen != (locked || yarn) {
+			t.Errorf("%s: frozen %v:\n%s", name, frozen, script)
+		}
+		if !strings.Contains(script, "VP_NODE_MANAGER=$vp_node") || !strings.Contains(script, "if ! vp --version") {
+			t.Errorf("%s: no guarded vp install:\n%s", name, script)
+		}
+		if out, err := exec.Command("bash", "-n", "-c", script).CombinedOutput(); err != nil {
+			t.Errorf("%s: script does not parse: %v %s", name, err, out)
+		}
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"devDependencies":{"vite":"7"}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, "vite.config.ts"), []byte(`import { defineConfig } from "vite";`), 0o644)
+	os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), nil, 0o644)
+	if _, found := detectSetup(dir); !slices.Equal(found, []string{"pnpm install"}) {
+		t.Fatalf("plain vite: %v", found)
+	}
+	if jsProject(t.TempDir()) || jsProject("") {
+		t.Fatal("a tree without package.json is a JS project")
+	}
+}
+
+// TestNodeBinPath: the login profile snippet and box run's prelude put
+// node_modules/.bin first on PATH under a POSIX sh (dash where present),
+// nearest directory first, and leave PATH alone without one.
+func TestNodeBinPath(t *testing.T) {
+	shells := []string{"sh"}
+	if _, err := exec.LookPath("dash"); err == nil {
+		shells = append(shells, "dash")
+	}
+	tree := filepath.Join(t.TempDir(), "my work")
+	sub := filepath.Join(tree, "packages", "web")
+	for _, d := range []string{filepath.Join(tree, "node_modules", ".bin"), filepath.Join(sub, "node_modules", ".bin")} {
+		os.MkdirAll(d, 0o755)
+	}
+	// Past the mise activation (a bash-only step).
+	prelude := boxRunPrelude[strings.Index(boxRunPrelude, "fi; ")+4:]
+	for _, sh := range shells {
+		profile := nodeBinProfile(tree)
+		cmd := exec.Command(sh, "-c", profile+profile+`printf %s "$PATH"`)
+		cmd.Env = []string{"PATH=/usr/bin:/bin"}
+		out, err := cmd.Output()
+		want := filepath.Join(tree, "node_modules/.bin") + ":/usr/bin:/bin"
+		if err != nil || string(out) != want {
+			t.Errorf("%s profile: %q %v, want %q (once)", sh, out, err, want)
+		}
+		cmd = exec.Command(sh, "-c", prelude, "box-run", sh, "-c", `printf %s "$PATH"`)
+		cmd.Dir = sub
+		cmd.Env = []string{"PATH=/usr/bin:/bin"}
+		out, err = cmd.Output()
+		want = filepath.Join(sub, "node_modules/.bin") + ":" + filepath.Join(tree, "node_modules/.bin") + ":/usr/bin:/bin"
+		if err != nil || string(out) != want {
+			t.Errorf("%s prelude: %q %v, want %q", sh, out, err, want)
+		}
+		cmd = exec.Command(sh, "-c", prelude, "box-run", sh, "-c", `printf %s "$PATH"`)
+		cmd.Dir, cmd.Env = t.TempDir(), []string{"PATH=/usr/bin:/bin"}
+		if out, err := cmd.Output(); err != nil || string(out) != "/usr/bin:/bin" {
+			t.Errorf("%s prelude without node_modules: %q %v", sh, out, err)
+		}
+	}
+}
+
+// TestJSBoxMemory: a new box of a JS project defaults to DefaultJSBoxMemory
+// unless --memory or --type says otherwise or the host cannot hold it;
+// other projects keep the host default.
+func TestJSBoxMemory(t *testing.T) {
+	var maxMem, budget int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		caps := api.HostCapabilities{Capacity: &domain.HostCapacity{MemoryBudgetBytes: budget}}
+		caps.Runtime.Shape.MaxMemoryBytes = maxMem
+		json.NewEncoder(w).Encode(caps)
+	}))
+	defer srv.Close()
+	cl, err := newClient(srv.URL, "req_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diag bytes.Buffer
+	s := &session{cl: cl, out: &printer{stdout: io.Discard, stderr: &diag}}
+	js, plain := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(js, "package.json"), []byte("{}"), 0o644)
+	ctx := context.Background()
+	mem := func(o *opts, dir string) int64 {
+		if sh := s.newBoxShape(ctx, o, dir); sh != nil {
+			return sh.MemoryBytes
+		}
+		return 0
+	}
+	if got := mem(&opts{}, js); got != DefaultJSBoxMemory {
+		t.Fatalf("JS project: %d", got)
+	}
+	if got := mem(&opts{cpus: 4}, js); got != DefaultJSBoxMemory {
+		t.Fatalf("JS project with --cpus: %d", got)
+	}
+	if got := mem(&opts{}, plain); got != 0 {
+		t.Fatalf("plain project: %d", got)
+	}
+	o := &opts{}
+	o.memory.v = 2 * domain.GiB
+	if got := mem(o, js); got != 2*domain.GiB {
+		t.Fatalf("--memory: %d", got)
+	}
+	if got := mem(&opts{typ: "small"}, js); got != 0 {
+		t.Fatalf("--type: %d", got)
+	}
+	maxMem = 8 * domain.GiB
+	budget = 3 * domain.GiB
+	if got := mem(&opts{}, js); got != 0 || !strings.Contains(diag.String(), "keeping the host default") {
+		t.Fatalf("budget below 4 GiB: %d %q", got, diag.String())
 	}
 }
 

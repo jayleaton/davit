@@ -186,6 +186,26 @@ error: image setup exited 1 (its output: `davit history PROJECT--image PROCESS`)
 worktree, as the image's default user (who has passwordless `sudo`), in a login shell.
 [project-boxes.md](project-boxes.md#the-project-image-and-its-setup) lists what is detected.
 
+An exit of 137 is the guest killing the setup (or a `box run` command) for memory. A JS project's boxes get
+4 GiB, other projects' 2 GiB ([Box shape](project-boxes.md#box-shape)); ask for more with `--memory 8GiB`, which
+also resizes an existing box ([below](#box-out-of-memory)).
+
+## Box out of memory
+
+**What it means.** `box run` exits with 137 (128 + SIGKILL) and nothing else failed: the guest kernel's OOM
+killer usually ended the command because the box has too little memory. `davit box run -- grep MemTotal
+/proc/meminfo` shows what the box has. A JS project's boxes start with 4 GiB, others with 2 GiB
+([Box shape](project-boxes.md#box-shape)).
+
+**Fix.** Give the box more: `davit box up --memory 4GiB` (or `box run --memory 4GiB -- …`). An existing box
+is resized and keeps the new size ([project-boxes.md](project-boxes.md#resizing-a-box)). A running box is
+stopped and started again, its disk kept. If processes started through davit still run in it, the command
+refuses (`stop_required`), names them and says what to run once they are done:
+
+```text
+error: box PROJECT/INSTANCE runs with 2 cpu, 2.0 GiB memory, 8.0 GiB disk; the new shape needs a restart, which would end the 1 process(es) started through davit still running in it (PROCESS). When they are done, run `davit box down PROJECT/INSTANCE` and then `davit box up PROJECT/INSTANCE --memory 4GiB` (stop_required)
+```
+
 ## Host full
 
 A box that does not fit does not fail at once. The host first stops idle boxes to make room, then the command
@@ -226,7 +246,8 @@ davit box image rm PROJECT --yes      # delete a project image and its versions 
 `box gc --rm-older-than 7d` also deletes VMs stopped for at least that long, and `--dry-run` lists what it would
 do. Other options:
 
-- Ask for less: `davit box up --memory 1GiB` (or `--cpus`, `--disk`) when the VM is created.
+- Ask for less: `davit box up --memory 1GiB` (or `--cpus`); on a box that exists this resizes it
+  ([project-boxes.md](project-boxes.md#resizing-a-box)). The disk only grows.
 - Wait longer: `--wait 10m` on `box up`, `run`, `ssh` or `sync`.
 - Raise the limits, if the host has the room: set `limits` in the daemon's config on the host, then
   `systemctl --user restart davit`. [vm-host.md](vm-host.md#capacity-running-vs-parked-boxes) explains

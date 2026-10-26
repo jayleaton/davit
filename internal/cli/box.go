@@ -94,11 +94,15 @@ func boxFlags(fs *flag.FlagSet, o *opts) {
 	fs.StringVar(&o.image, "image", "", "up without a project image: image for the instance (ref or digest)")
 	fs.StringVar(&o.image, "from", "", "image build: base image (ref or digest)")
 	shapeFlags(fs, o, true)
+	// On an existing box they resize it (box_resize.go).
+	for _, f := range []string{"type", "cpus", "memory", "disk"} {
+		fs.Lookup(f).Usage += "; resizes an existing box (a running one restarts, disk kept) and it keeps the shape"
+	}
 	fs.Var(&o.box.idle, "idle", "stop the box after this long unused (default 15m, $"+BoxIdleEnv+"; 0s: never); gc: stop boxes idle at least this long (default 10m)")
 	fs.Var(&o.box.wait, "wait", "up/run/ssh/sync: when the host is full, wait this long in its queue for capacity (default 3m; 0s: fail at once)")
 	fs.Var(ageFlag{&o.box.rmOlder}, "rm-older-than", "gc: delete instances stopped at least this long, e.g. 7d (never a project image)")
 	fs.BoolVar(&o.box.dryRun, "dry-run", false, "gc: list what would be stopped or deleted")
-	fs.BoolVar(&o.box.refresh, "refresh", false, "up: recreate the instance from the latest image generation")
+	fs.BoolVar(&o.box.refresh, "refresh", false, "up: recreate the instance from the latest image generation (same CPUs and memory; the disk is discarded)")
 	fs.StringVar(&o.box.setup, "setup", "", "image build/update: setup script (default "+defaultSetupFile+", else "+legacySetupFile+", in the tree)")
 	fs.StringVar(&o.box.setupCmd, "setup-cmd", "", "image build/update: setup shell command instead of a script")
 	fs.StringVar(&o.box.dir, "dir", "", "image build/update: DIR[:GUEST_PATH] synced into the builder first (default the worktree); the setup runs there")
@@ -439,34 +443,38 @@ type boxUpResult struct {
 
 // boxUp brings an instance up: resumes it if it is stopped (or failed),
 // waits out an operation in progress, creates it from the latest image
-// generation if there is none (or, with --refresh, if it is older).
-// report prints the result (box up itself); ssh/run/sync only say what
-// they did.
+// generation if there is none (or, with --refresh, if it is older), and
+// restarts it with --type/--cpus/--memory/--disk when they change its
+// shape (box_resize.go). report prints the result (box up itself);
+// ssh/run/sync only say what they did.
 func (s *session) boxUp(ctx context.Context, o *opts, ref boxRef, report bool) (api.VM, error) {
 	start := time.Now()
 	name := ref.vm()
-	action := "running"
+	refreshed := false
 	if o.box.refresh {
-		refreshed, err := s.boxRefresh(ctx, o, ref)
+		old, err := s.boxRefresh(ctx, o, ref)
 		if err != nil {
 			return api.VM{}, err
 		}
-		if refreshed {
-			action = "refreshed"
+		if refreshed = old != nil; refreshed && o.typ == "" {
+			// The new disk starts from the image (at its size); the CPUs
+			// and memory stay unless given.
+			if o.cpus == 0 {
+				o.cpus = old.CPUs
+			}
+			if o.memory.v == 0 {
+				o.memory.v = old.MemoryBytes
+			}
 		}
 	}
-	vm, created, resumed, err := s.ensureRunning(ctx, o, name, ref.project, func() (*api.CreateVMRequest, error) {
+	vm, action, err := s.ensureRunning(ctx, o, name, ref.project, func() (*api.CreateVMRequest, error) {
 		return s.instanceRequest(ctx, o, ref)
 	})
 	if err != nil {
 		return vm, err
 	}
-	switch {
-	case action == "refreshed":
-	case created:
-		action = "created"
-	case resumed:
-		action = "resumed"
+	if refreshed {
+		action = "refreshed"
 	}
 	gen, _ := strconv.Atoi(vm.Labels[labelBoxGeneration])
 	res := boxUpResult{Box: ref.project + "/" + ref.instance, Project: ref.project, Instance: ref.instance, Action: action,
@@ -493,8 +501,15 @@ func (s *session) instanceRequest(ctx context.Context, o *opts, ref boxRef) (*ap
 	if err != nil {
 		return nil, err
 	}
+	// The project's tree (as the image build reads it) decides a JS default.
+	tree := defaultTree()
+	if o.box.dir != "" {
+		if ps, err := parsePushSpec(o.box.dir); err == nil {
+			tree = ps.dir
+		}
+	}
 	no := false
-	body := &api.CreateVMRequest{Name: ref.vm(), Type: o.typ, Shape: o.shape(), AutoStop: &no, IdleTimeoutSeconds: int64(idle / time.Second),
+	body := &api.CreateVMRequest{Name: ref.vm(), Type: o.typ, Shape: s.newBoxShape(ctx, o, tree), AutoStop: &no, IdleTimeoutSeconds: int64(idle / time.Second),
 		Labels: map[string]string{domain.LabelBox: ref.project, labelBoxInstance: ref.instance, labelBoxGeneration: "0"}}
 	if len(gens) == 0 {
 		// The first instance of a project builds its image (the setup from
@@ -520,79 +535,99 @@ func (s *session) instanceRequest(ctx context.Context, o *opts, ref boxRef) (*ap
 }
 
 // boxRefresh deletes an instance that is older than the latest image
-// generation (it is then created again). It reports whether it did.
-func (s *session) boxRefresh(ctx context.Context, o *opts, ref boxRef) (bool, error) {
+// generation (it is then created again). It returns the deleted
+// instance's shape, nil when it kept the instance.
+func (s *session) boxRefresh(ctx context.Context, o *opts, ref boxRef) (*domain.Shape, error) {
 	vm, err := s.boxVM(ctx, ref.vm(), ref.project)
 	if isCode(err, domain.CodeNotFound) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	gens, err := s.imageGenerations(ctx, ref.project)
 	if err != nil || len(gens) == 0 {
-		return false, err
+		return nil, err
 	}
 	have, _ := strconv.Atoi(vm.Labels[labelBoxGeneration])
 	latest := gens[len(gens)-1].N
 	if have >= latest {
 		s.out.diag("box %s/%s already runs image generation %d", ref.project, ref.instance, have)
-		return false, nil
+		return nil, nil
 	}
 	s.out.diag("warning: refreshing box %s/%s from image generation %d to %d discards its disk: anything not synced out "+
 		"(`box sync --pull`) or pushed from inside it is lost", ref.project, ref.instance, have, latest)
 	acc, err := s.cl.mutate(ctx, http.MethodDelete, vmPath(string(vm.ID)), nil, newIdempotencyKey())
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return true, s.await(ctx, o, &acc.Operation)
+	return &vm.Shape, s.await(ctx, o, &acc.Operation)
 }
 
 // ensureRunning brings VM name (a box of project) to ready: waits out an
 // operation, resumes it when stopped or failed, creates it with create()
-// when there is none (create nil: not_found).
-func (s *session) ensureRunning(ctx context.Context, o *opts, name, project string, create func() (*api.CreateVMRequest, error)) (vm api.VM, created, resumed bool, err error) {
+// when there is none (create nil: not_found), and restarts a running one
+// whose shape --type/--cpus/--memory/--disk change (box_resize.go). The
+// action is running (nothing to do), created, resumed or resized.
+func (s *session) ensureRunning(ctx context.Context, o *opts, name, project string, create func() (*api.CreateVMRequest, error)) (vm api.VM, action string, err error) {
+	action = "running"
+	checked := o.typ == "" && o.shape() == nil // nothing to resize to
 	for attempt := 0; ; attempt++ {
 		if attempt > 8 {
-			return vm, created, resumed, clientErr(domain.CodeUnavailable, "box %s did not settle; try again", name)
+			return vm, action, clientErr(domain.CodeUnavailable, "box %s did not settle; try again", name)
 		}
 		vm, err = s.boxVM(ctx, name, project)
 		switch {
 		case isCode(err, domain.CodeNotFound):
 			if create == nil {
-				return vm, false, false, err
+				return vm, action, err
 			}
 			body, err := create()
 			if err != nil {
-				return vm, false, false, err
+				return vm, action, err
 			}
 			acc, err := s.capacityMutate(ctx, "/vms", body, o.boxWait())
 			if isCode(err, domain.CodeInvalidArgument) && strings.Contains(err.Error(), "already exists") {
 				continue // created concurrently: look again
 			}
 			if err != nil {
-				return vm, false, false, err
+				return vm, action, err
 			}
 			s.out.diag("box %s: creating (operation %s)", name, acc.Operation.ID)
 			if err := s.await(ctx, o, &acc.Operation); err != nil {
-				return vm, false, false, err
+				return vm, action, err
 			}
-			created = true
+			action, checked = "created", true
 			continue
 		case err != nil:
-			return vm, created, resumed, err
+			return vm, action, err
 		}
 		if vm.ActiveOperationID != "" {
 			s.out.diag("box %s: waiting for operation %s", name, vm.ActiveOperationID)
 			op := api.Operation{ID: vm.ActiveOperationID}
 			if err := s.await(ctx, o, &op); err != nil {
-				return vm, created, resumed, err
+				return vm, action, err
 			}
 			continue
 		}
 		switch vm.State {
 		case domain.StateReady, domain.StateRunning:
-			return vm, created, resumed, nil
+			if checked {
+				return vm, action, nil
+			}
+			checked = true
+			step, err := s.stopToResize(ctx, o, vm)
+			switch {
+			case err != nil:
+				return vm, action, err
+			case step == resizeStopped:
+				action = "resized"
+			case step == resizeResumed && action == "running":
+				action = "resumed"
+			case step == resizeAgain:
+				checked = false
+			}
+			continue
 		case domain.StateStopped, domain.StateError:
 			body := api.ResumeVMRequest{Type: o.typ, Shape: o.shape()}
 			acc, err := s.capacityMutate(ctx, vmPath(name)+"/resume", body, o.boxWait())
@@ -600,13 +635,19 @@ func (s *session) ensureRunning(ctx context.Context, o *opts, name, project stri
 				continue
 			}
 			if err != nil {
-				return vm, created, resumed, err
+				if action == "resized" {
+					err = resizeStranded(err, vm)
+				}
+				return vm, action, err
 			}
 			s.out.diag("box %s: resuming (operation %s)", name, acc.Operation.ID)
 			if err := s.await(ctx, o, &acc.Operation); err != nil {
-				return vm, created, resumed, err
+				return vm, action, err
 			}
-			resumed = true
+			if action == "running" {
+				action = "resumed"
+			}
+			checked = true // the resume booted the new shape
 			continue
 		}
 		time.Sleep(200 * time.Millisecond) // provisioning, stopping: an operation is about to show

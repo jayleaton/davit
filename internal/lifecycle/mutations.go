@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -610,10 +611,19 @@ func (s *Service) Resume(ctx context.Context, req Request, ref string, body api.
 		return nil, err
 	}
 	req.VMRef = ref
-	return s.withRoom(ctx, req, req.CapacityWait, func() (*Accepted, error) { return s.resume(ctx, req, ref, body) })
+	// A ready or running VM needs no room (its resume is a no-op or a
+	// refused resize): answer at once, never behind the capacity queue.
+	if acc, err := s.resume(ctx, req, ref, body, true); !errors.Is(err, errNotUp) {
+		return acc, err
+	}
+	return s.withRoom(ctx, req, req.CapacityWait, func() (*Accepted, error) { return s.resume(ctx, req, ref, body, false) })
 }
 
-func (s *Service) resume(ctx context.Context, req Request, ref string, body api.ResumeVMRequest) (*Accepted, error) {
+// errNotUp is resume's answer, with upOnly, for a VM that is not ready or
+// running.
+var errNotUp = errors.New("vm is not up")
+
+func (s *Service) resume(ctx context.Context, req Request, ref string, body api.ResumeVMRequest, upOnly bool) (*Accepted, error) {
 	return s.mutate(ctx, req, body, false, func(tx *state.Tx, now time.Time) (*domain.Operation, error) {
 		rec, err := lookupVM(tx, req.Principal, ref)
 		if err != nil {
@@ -632,6 +642,9 @@ func (s *Service) resume(ctx context.Context, req Request, ref string, body api.
 				return nil, err
 			}
 			return noop(domain.OpResume, vm.ID, domain.OpParams{}), nil
+		}
+		if upOnly {
+			return nil, errNotUp
 		}
 		if vm.State != domain.StateStopped && vm.State != domain.StateError {
 			return nil, domain.Errorf(domain.CodeInvalidState, "cannot resume vm in state %s", vm.State).WithDetail("state", vm.State)

@@ -12,8 +12,14 @@ import (
 )
 
 // boxRunPrelude runs `box run`'s command in a login shell with mise's
-// shims on PATH, so the image's toolchains and a project's mise pins apply.
-const boxRunPrelude = `if command -v mise >/dev/null 2>&1; then eval "$(mise activate bash --shims 2>/dev/null)"; fi; exec "$@"`
+// shims on PATH, so the image's toolchains and a project's mise pins apply,
+// and in front of them every node_modules/.bin from the directory up, the
+// nearest first (as npm run does), so a JS project's own tools (vp, tsc)
+// resolve. POSIX sh apart from mise's bash activation.
+const boxRunPrelude = `if command -v mise >/dev/null 2>&1; then eval "$(mise activate bash --shims 2>/dev/null)"; fi; ` +
+	`_davit_d=$PWD; _davit_p=; while [ -n "$_davit_d" ]; do if [ -d "$_davit_d/node_modules/.bin" ]; then ` +
+	`_davit_p=$_davit_p${_davit_p:+:}$_davit_d/node_modules/.bin; fi; _davit_d=${_davit_d%/*}; done; ` +
+	`if [ -n "$_davit_p" ]; then PATH=$_davit_p:$PATH; export PATH; fi; unset _davit_d _davit_p; exec "$@"`
 
 // looksLikePath reports whether a `box sync` argument is a directory
 // (., .., ./x, ../x, ~/x, an absolute path, or DIR:/GUEST) rather than

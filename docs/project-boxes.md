@@ -68,9 +68,18 @@ setup is, in order of preference:
 |---|---|
 | `mise.toml`, `.mise.toml`, `.tool-versions` | `mise trust`, `mise install`; the later steps then run under `mise exec --` |
 | `go.mod` | `go mod download` |
+| `package.json` of a [Vite+](https://viteplus.dev) project (`vite-plus` in its dependencies or devDependencies, or a `vite.config.*` importing it) | vp's installer (`https://vite.plus`) unless the image or mise has `vp`, then `vp install` (`--frozen-lockfile` with a lockfile), which uses the package manager and version `packageManager` pins. The installer puts vp on PATH in `~/.profile` and `~/.bashrc`; it installs Node.js too when neither the image nor mise has it |
 | `package.json` + `pnpm-lock.yaml` / `package-lock.json` / `yarn.lock` / `bun.lock` / none | `pnpm install --frozen-lockfile` / `npm ci` / `yarn install` (through corepack) / `bun install` / `npm install` |
 | `uv.lock` / `pyproject.toml` / `requirements.txt` | `uv sync --frozen` / `uv sync` / a `.venv` with `uv pip install -r` |
 | a Makefile with a `setup` target | `make setup` |
+
+For a JS project (a `package.json` at the top of the tree, whatever its setup), the image also puts the
+synced tree's `node_modules/.bin` on PATH in login shells (`/etc/profile.d/davit-node-bin.sh`, or
+`~/.profile` when the image user has no sudo; POSIX, so a `/bin/sh` that is dash reads it too), so `box ssh`
+finds the project's own `vp`, `tsc` or `eslint`. Directories that `~/.profile` adds (vp's installer adds its
+own) come before it there. `box run` also puts every `node_modules/.bin` from its
+directory up first, nearest first, as `npm run` does. An image built before this gets the profile line at its
+next `box image update`.
 
 Outside a git work tree nothing is synced, and the setup runs in an empty work dir. Commit a
 `.davit/setup.sh` when the detection is not enough (services, generated code, warm build caches);
@@ -83,7 +92,7 @@ Outside a git work tree nothing is synced, and the setup runs in an empty work d
 | `box image build [PROJECT] [--from IMAGE] [--setup FILE \| --setup-cmd CMD] [--dir DIR[:GUEST]] [--cpus/--memory/--disk]` | Creates the builder from IMAGE (default the host's), syncs the worktree (or `--dir`) into it with a git index, runs the setup there, stops it and snapshots generation 1. A failed setup leaves the builder running for a look and says how to read the setup's output; the builder stops itself when idle. |
 | `box image update [PROJECT] [--setup ...]` | Resumes the builder (generation N's disk), syncs, runs the setup again on top and snapshots generation N+1. Older generations stay, and instances made from them keep working. |
 | `box image rm [PROJECT] [--force] --yes` | Deletes the project image: the builder and every generation snapshot, whose disks and goldens the host then frees. It refuses while the project has instances; `--force` deletes them too, with their disks. |
-| `box up [PROJECT[/INSTANCE]] [--refresh] [--image I] [--cpus/--memory/--disk] [--idle 15m] [--wait 3m]` | Resumes the instance, waits out an operation in progress, or creates it from the latest generation. A project without an image gets one built first (from `--image`, else the host's default image). `--refresh` recreates an instance that is older than the latest generation; it warns that the instance's disk is discarded. When the host is full it waits up to `--wait` for room ([below](#when-the-host-is-full)); `run`, `ssh` and `sync` take `--wait` too. |
+| `box up [PROJECT[/INSTANCE]] [--refresh] [--image I] [--cpus/--memory/--disk] [--idle 15m] [--wait 3m]` | Resumes the instance, waits out an operation in progress, or creates it from the latest generation. A project without an image gets one built first (from `--image`, else the host's default image). `--refresh` recreates an instance that is older than the latest generation, keeping its CPUs and memory unless given; it warns that the instance's disk is discarded. `--cpus/--memory/--disk` on an existing instance resize it ([below](#resizing-a-box)). When the host is full it waits up to `--wait` for room ([below](#when-the-host-is-full)); `run`, `ssh` and `sync` take `--wait` too. |
 | `box down [PROJECT[/INSTANCE]] [--force]` | Runs `sync` in the guest, then a clean stop that commits the disk. |
 | `box run [PROJECT[/INSTANCE]] [--cwd DIR] [-e K=V] [--timeout D] [--stdin] [--no-sync] [--raw] -- CMD...` | Brings the instance up and syncs the worktree first (`--no-sync` skips that). Then it runs CMD in a login shell with the project's mise pins (`--raw`: exactly CMD), in the current directory's place in the synced tree (`--cwd` overrides it). It streams stdout and stderr separately and exits with CMD's code (124 on `--timeout`, 128+N on a signal). `--json` streams events with the exit as the last line. |
 | `box ssh [PROJECT[/INSTANCE]] [-- CMD...]` | Real OpenSSH into the instance: a short-lived certificate and the pinned host key, through the API tunnel. |
@@ -103,6 +112,44 @@ Outside a git work tree nothing is synced, and the setup runs in an empty work d
 - A failed setup: its exit code and `davit history` to read its output.
 
 `$DAVIT_BOX_WORKDIR` moves the synced tree for images with another layout.
+
+## Box shape
+
+A new box (the builder at `box image build`, an instance when `box up`, `run`, `ssh` or `sync` creates it)
+gets the host's default shape: 2 CPUs, 2 GiB memory, 8 GiB disk. A JS project's boxes (a `package.json` at
+the top of the worktree, or of `--dir`) get 4 GiB memory instead, because package installs, type checks and
+linters of a JS workspace are killed for memory (exit 137) in 2 GiB. `--memory` or `--type` replaces either
+default. The 4 GiB counts against the host's memory reservation like any `--memory`: when the host is full the
+box waits in the queue ([below](#when-the-host-is-full)), and a host that can never hold 4 GiB in one VM
+(the engine's largest VM, `limits.memoryBytes` or the reservation budget below it) keeps its default and says
+so. The default applies only when a box is created: an existing box keeps its shape, and `box up` without
+flags never resets it to a default. `--cpus`, `--memory` or `--disk` on an existing box resize it
+([below](#resizing-a-box)).
+
+## Resizing a box
+
+`--cpus`, `--memory` and `--disk` (or `--type`) on `box up`, `run`, `ssh` or `sync` also apply to an instance
+that already exists, and the host keeps the new shape: every later `box up`, flags or not, boots it.
+`box ls` (and `--json`: `cpus`, `memoryBytes`, `diskBytes`) shows it. The disk only grows.
+
+- **Stopped:** it starts with the new shape.
+- **Running:** a VM's shape changes only when it boots, so the box is stopped (its disk committed, as by
+  `box down`) and started again with the new shape. stderr says so: `box P/I: resizing from 1 cpu, 2.0 GiB
+  memory, 8.0 GiB disk to --memory 4GiB: stopping it ...`. Open `box ssh` sessions end. If a process started
+  through davit (a `box run`, attached or detached, or a `davit exec`) still runs in it, nothing is stopped:
+  the error (`stop_required`, exit 6) names the processes and the commands to run once they are done,
+  `davit box down P/I` then `davit box up P/I --memory 4GiB`.
+- The same shape again changes nothing (also while others queue for capacity), and a shape the host refuses
+  (above its limits, a smaller disk) fails before the box stops.
+
+A resize always boots the box's committed disk (a resume never restores a memory snapshot, which is tied to
+the shape it was taken with), so the disk's contents carry over unchanged. The new shape is admitted like any
+resume: through the reservation and the `--wait` queue below. If it gets no room, the box stays stopped with
+its disk and old shape, and the error says so; `box up` without the flags starts it as it was.
+
+Known limits: the check for running work sees only processes started through davit. Open `box ssh` sessions
+(and anything started from them) do not stop a resize; they end with the restart. The host keeps the newest
+1024 process records per VM, so a process started before the 1024 most recent ones is not seen either.
 
 ## When the host is full
 
@@ -131,7 +178,8 @@ Admission checks two things:
   [vm-host.md](vm-host.md#capacity-running-vs-parked-boxes) has the numbers.
 
 Over the API, `createVM` and `resumeVM` take `?waitSeconds=` (0 by default). While someone waits, a request
-without a wait fails at once rather than overtaking. `capabilities.capacity` reports `waiting`,
+without a wait fails at once rather than overtaking (a `resumeVM` of a ready VM needs no room and answers at
+once). `capabilities.capacity` reports `waiting`,
 `reclaimable` and `memoryBudgetBytes`. `POST /vms/reclaim` is `box gc` (feature `capacityReclaim`).
 
 ## Idle stop

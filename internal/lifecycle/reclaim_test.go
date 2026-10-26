@@ -84,7 +84,8 @@ func TestReclaimForRoom(t *testing.T) {
 
 // TestCapacityWait: with no room, a request with a wait queues FIFO (seen in
 // the capacity report under its ticket) and is admitted when a VM stops; a
-// request without a wait fails at once while someone waits; a wait that
+// request without a wait fails at once while someone waits (a resume of a
+// ready VM, which needs no room, still answers); a wait that
 // runs out answers resource_exhausted with waitedSeconds.
 func TestCapacityWait(t *testing.T) {
 	e := newEnv(t, fake.Options{}, func(c *Config) { c.Limits = domain.Limits{VMs: 1} })
@@ -120,6 +121,13 @@ func TestCapacityWait(t *testing.T) {
 	_, err = e.svc.Create(ctx, e.req(e.newKey()), api.CreateVMRequest{Name: "c"})
 	if de := domain.AsError(err); de.Code != domain.CodeResourceExhausted || de.Details["resource"] != "queue" || de.Details["waiting"] != 1 {
 		t.Fatalf("no-wait request behind a waiter: %+v", de)
+	}
+	// A ready VM's resume needs no room: answered at once, not queued.
+	if a, err := e.svc.Resume(ctx, e.req(e.newKey()), "a", api.ResumeVMRequest{}); err != nil || !a.Operation.Result.NoOp {
+		t.Fatalf("resume of a ready VM behind a waiter: %+v %v", a, err)
+	}
+	if _, err := e.svc.Resume(ctx, e.req(e.newKey()), "a", resizeTo(api.ShapeOverride{CPUs: 4})); !domain.IsCode(err, domain.CodeStopRequired) {
+		t.Fatalf("resize of a ready VM behind a waiter: %v", err)
 	}
 	e.mustSucceed(e.svc.Stop(ctx, e.req(""), "a", false))
 	select {
