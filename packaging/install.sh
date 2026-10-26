@@ -12,7 +12,8 @@
 # `davit connect user@host`.
 #
 # Rerunning is safe and upgrades: the binary and changed images are replaced, the config is
-# kept and the service restarts on the new version. Run `sh install.sh --help` for options.
+# kept and the service restarts on the new version. An installed davit.service names the
+# install to upgrade (its binary and --config), wherever an earlier setup put them. Run `sh install.sh --help` for options.
 #
 # Every download is checked against the SHA256SUMS file of the same release (integrity:
 # no corruption or truncation). Authenticity rests on HTTPS from the release host; releases
@@ -76,7 +77,8 @@ Options:
   --version TAG        install this release instead of the latest
   --from URL|DIR       install from another release location (https://, file://, or a
                        local directory such as a \`make release\` output)
-  --install-dir DIR    where the binary goes (default ~/.local/bin)
+  --install-dir DIR    where the binary goes (default ~/.local/bin; an upgrade keeps the
+                       binary where the installed $NAME.service runs it)
   --fake-runtime       development only: no KVM, VMs are simulated (never for real use)
 
 Environment: DAVIT_RELEASE_URL, DAVIT_VERSION, DAVIT_INSTALL_DIR, DAVIT_DATA_DIR and
@@ -216,6 +218,10 @@ install_image() {
 		say "image $_name: up to date"
 		return 0
 	fi
+	_old_rootfs=
+	if [ -f "$DATA/images/manifests/$_name.json" ]; then
+		_old_rootfs=$(rootfs_digest "$DATA/images/manifests/$_name.json")
+	fi
 	mkdir -p "$DATA/images/blobs/sha256" "$DATA/images/manifests" "$DATA/images/.bundles" || die "cannot create $DATA/images"
 	IMG_STAGE=$(mktemp -d "$DATA/images/.install.XXXXXX") || die "cannot create a staging dir in $DATA/images"
 	say "image $_name: downloading $_bundle"
@@ -251,6 +257,58 @@ install_image() {
 	IMG_STAGE=
 	IMAGES_CHANGED=1
 	say "image $_name: installed"
+	drop_rootfs "$_old_rootfs"
+}
+
+# rootfs_digest MANIFEST: the hex digest of the rootfs blob MANIFEST names (nothing when it
+# names none).
+rootfs_digest() {
+	sed -n '/"rootfs": *{/,/"digest"/ s/.*"digest": *"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# drop_rootfs HEX: remove a replaced image's rootfs blob when no manifest in the data dir or
+# the config uses it any more. Only creates and goldens read an image rootfs (a VM's disk is
+# its own clone, a resume boots that), so the daemon's golden sweep then drops the goldens
+# captured from it; kernels stay, since existing VMs boot them.
+drop_rootfs() {
+	[ -n "$1" ] && [ -f "$DATA/images/blobs/sha256/$1" ] || return 0
+	for _m in "$DATA"/images/manifests/*.json $(sed -n 's/^ *"manifest": *"\(.*\)",\{0,1\} *$/\1/p' "$CONFIG" 2>/dev/null); do
+		if [ -f "$_m" ] && grep -q "sha256:$1" "$_m"; then
+			return 0
+		fi
+	done
+	rm -f "$DATA/images/blobs/sha256/$1"
+	say "removed the replaced rootfs blob $(printf '%.12s' "$1")"
+}
+
+# unit_exec N: field N (1 the binary, 2 the config) of the installed unit's
+# ExecStart="BIN" daemon --config "CONFIG" (`davit init --service` writes it; systemd's %%
+# is a literal %).
+unit_exec() {
+	_re='^ExecStart="\([^"]*\)" daemon --config "\([^"]*\)" *$'
+	sed -n "s/$_re/\\$1/p" "$UNIT" | head -n 1 | sed 's/%%/%/g'
+}
+
+# existing_install: an installed davit.service is the install to upgrade, wherever an earlier
+# install (or `davit init --config ... --service`) put it: its config (and so its data dir)
+# and its binary stay where they are, so a rerun never starts a second, empty setup beside
+# the one that runs.
+existing_install() {
+	[ -f "$UNIT" ] || return 0
+	_ubin=$(unit_exec 1)
+	_ucfg=$(unit_exec 2)
+	[ -n "$_ubin" ] && [ -n "$_ucfg" ] ||
+		die "$UNIT has no ExecStart=\"BIN\" daemon --config \"CONFIG\" line, so this installer cannot tell which setup it runs; fix or remove it, then rerun"
+	[ "${_ubin##*/}" = "$NAME" ] || die "$NAME.service runs $_ubin; an upgrade installs $NAME. Fix $UNIT (or remove it), then rerun"
+	if [ "$INSTALL_DIR_SET" = 1 ] && [ "${INSTALL_DIR%/}/$NAME" != "$_ubin" ]; then
+		die "$NAME.service runs $_ubin, not ${INSTALL_DIR%/}/$NAME: rerun without --install-dir to upgrade it in place"
+	fi
+	INSTALL_DIR=${_ubin%/*}
+	if [ "$_ucfg" != "$CONFIG" ]; then
+		[ ! -f "$CONFIG" ] || warn "$CONFIG is not the config $NAME.service runs; upgrading the one it runs ($_ucfg)"
+		CONFIG=$_ucfg
+	fi
+	say "upgrading the install $NAME.service runs: $_ubin --config $CONFIG"
 }
 
 # free_kib DIR: free KiB on the filesystem holding DIR (or its nearest existing ancestor).
@@ -260,9 +318,9 @@ free_kib() {
 	df -Pk "$_d" | awk 'NR == 2 { print $4 }'
 }
 
-# config_data_dir FILE: the dataDir an existing config names.
-config_data_dir() {
-	sed -n 's/^ *"dataDir": *"\(.*\)",\{0,1\} *$/\1/p' "$1" | head -n 1
+# config_field FILE FIELD: a top-level string field (dataDir, socket) a config names.
+config_field() {
+	sed -n 's/^ *"'"$2"'": *"\(.*\)",\{0,1\} *$/\1/p' "$1" | head -n 1
 }
 
 # quote ARG: ARG as one single-quoted shell word.
@@ -363,12 +421,15 @@ enable_linger() {
 	root_fixes "$TMP_DIR/linger"
 }
 
-# wait_daemon: wait for the service to answer (its first start downloads Firecracker and
-# verifies the image blobs).
+# wait_daemon: wait for the service to answer on the socket its config names (its first
+# start downloads Firecracker and verifies the image blobs).
 wait_daemon() {
 	_i=0
+	_sock=$(config_field "$CONFIG" socket)
+	set -- capabilities
+	if [ -n "$_sock" ]; then set -- --api-url "unix://$_sock" capabilities; fi
 	while [ "$_i" -lt 300 ]; do
-		if davit_run capabilities >/dev/null 2>&1; then
+		if davit_run "$@" >/dev/null 2>&1; then
 			return 0
 		fi
 		if ! systemctl --user is-active --quiet "$NAME.service" && [ "$_i" -gt 10 ]; then
@@ -411,15 +472,19 @@ install_host() {
 	check_systemd_user
 	need_tools
 
+	_xdg=${XDG_CONFIG_HOME:-}
+	case "$_xdg" in /*) ;; *) _xdg=$HOME/.config ;; esac
+	CONFIG=$_xdg/$NAME/config.json
+	UNIT=$_xdg/systemd/user/$NAME.service
+	DEFAULT_CONFIG=$CONFIG
+	existing_install
 	install_binary
-	CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/$NAME/config.json
-	case "${XDG_CONFIG_HOME:-}" in /*) ;; *) CONFIG=$HOME/.config/$NAME/config.json ;; esac
 
 	# 1. Configuration (no large downloads yet). The runtime is firecracker: a host whose KVM
 	#    is broken gets fixes and a failing doctor, never simulated VMs (--fake-runtime is
 	#    for development only).
 	if [ -f "$CONFIG" ]; then
-		DATA=$(config_data_dir "$CONFIG")
+		DATA=$(config_field "$CONFIG" dataDir)
 		[ -n "$DATA" ] || die "cannot read dataDir from $CONFIG"
 		[ -z "$DATA_ARG" ] || [ "$DATA_ARG" = "$DATA" ] || warn "keeping the data dir of the existing config ($DATA); --data-dir applies to a new install"
 	else
@@ -485,6 +550,10 @@ install_host() {
 		die "$NAME doctor reports a problem (above); fix it, then rerun this installer"
 	fi
 	path_note
+	if [ "$CONFIG" != "$DEFAULT_CONFIG" ]; then
+		echo
+		say "this host's config is $CONFIG; host commands need it, e.g. $NAME doctor --config $(quote "$CONFIG")"
+	fi
 	echo
 	say "this host is ready. From your laptop:"
 	printf '    curl -fsSL %s | sh -s -- --client\n' "$INSTALLER_URL"
@@ -541,6 +610,8 @@ main() {
 	IMAGES=$(printf '%s' "$IMAGES" | tr ',' ' ')
 	for _img in $IMAGES; do check_image_name "$_img"; done
 	case "$ARCH" in amd64) IMG_ARCH=x86_64 ;; arm64) IMG_ARCH=aarch64 ;; esac
+	INSTALL_DIR_SET=0
+	if [ -n "$INSTALL_DIR" ]; then INSTALL_DIR_SET=1; fi
 	[ -n "$INSTALL_DIR" ] || INSTALL_DIR=${HOME:?HOME is not set}/.local/bin
 
 	if [ -n "$VERSION" ]; then

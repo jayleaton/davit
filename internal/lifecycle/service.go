@@ -523,13 +523,19 @@ func (s *Service) Sweep(ctx context.Context) error {
 	s.rearmReserve()
 	now := s.now()
 	var due, warn, idle []*state.VMRecord
-	err := s.cfg.DB.Tx(ctx, func(tx *state.Tx) error {
+	// Housekeeping has its own transaction: a failure there must never stop
+	// the TTL and idle reclaim below. It is returned once they ran.
+	purgeErr := s.cfg.DB.Tx(ctx, func(tx *state.Tx) error {
 		if _, err := tx.PurgeIdempotency(now); err != nil {
 			return err
 		}
-		if _, err := tx.PurgeTombstones(now.Add(-s.cfg.TombstoneRetention)); err != nil {
-			return err
-		}
+		_, err := tx.PurgeTombstones(now.Add(-s.cfg.TombstoneRetention))
+		return err
+	})
+	if purgeErr != nil {
+		purgeErr = fmt.Errorf("purge: %w", purgeErr)
+	}
+	err := s.cfg.DB.Tx(ctx, func(tx *state.Tx) error {
 		vms, err := tx.AllVMs()
 		for _, r := range vms {
 			v := r.VM
@@ -579,5 +585,5 @@ func (s *Service) Sweep(ctx context.Context) error {
 			s.cfg.Log.Info("ttl expired; stopping", "vm", r.VM.ID)
 		}
 	}
-	return nil
+	return purgeErr
 }

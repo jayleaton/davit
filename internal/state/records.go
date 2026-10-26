@@ -256,8 +256,10 @@ func (t *Tx) Allocated() (domain.Shape, error) {
 	return s, nil
 }
 
-// PurgeTombstones removes deleted VMs (and their operations) whose deletion
-// is older than before. Returns the number removed.
+// PurgeTombstones removes deleted VMs whose deletion is older than before,
+// with every row that references them (operations, processes and their
+// output, conversations and prompts, credential grants). Returns the number
+// removed.
 func (t *Tx) PurgeTombstones(before time.Time) (int, error) {
 	rows, err := t.query(`SELECT id, doc FROM vms WHERE state = 'deleted'`)
 	if err != nil {
@@ -280,6 +282,9 @@ func (t *Tx) PurgeTombstones(before time.Time) (int, error) {
 		for _, q := range []string{
 			`DELETE FROM idempotency WHERE operation_id IN (SELECT id FROM operations WHERE vm_id = ?)`,
 			`DELETE FROM operations WHERE vm_id = ?`,
+			`DELETE FROM processes WHERE vm_id = ?`, // their output cascades
+			`DELETE FROM prompts WHERE conversation_id IN (SELECT id FROM conversations WHERE vm_id = ?)`,
+			`DELETE FROM conversations WHERE vm_id = ?`,
 			`DELETE FROM credential_grants WHERE vm_id = ?`,
 			`DELETE FROM vms WHERE id = ?`,
 		} {

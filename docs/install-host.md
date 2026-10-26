@@ -94,6 +94,11 @@ Rerun the same install command. The binary and any changed image are replaced, t
 service restarts on the new version; running VMs keep running across the restart. `davit version --check` tells
 you whether a newer release exists.
 
+An installed `davit.service` names the setup to upgrade: the new binary goes where its `ExecStart` runs the old
+one, and its `--config` (with that config's data dir) is kept, even when an earlier setup put them somewhere other
+than the defaults. A replaced image's rootfs blob is removed once no installed manifest uses it, and the daemon's
+golden sweep then drops the goldens captured from it; kernels stay for the VMs that boot them.
+
 To remove davit from a host:
 
 ```sh

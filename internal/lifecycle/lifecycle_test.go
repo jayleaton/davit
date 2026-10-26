@@ -401,6 +401,58 @@ func TestTTLSweepStops(t *testing.T) {
 	}
 }
 
+// TestSweepPurgesTombstoneWithChildren: a deleted VM that ran guest
+// processes and prompt turns is purged once its tombstone expires, and the
+// same sweep still stops an expired VM (a purge that failed on those rows'
+// foreign keys used to abort every sweep, TTL and idle reclaim included).
+func TestSweepPurgesTombstoneWithChildren(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	e := newEnv(t, fake.Options{}, func(c *Config) { c.Now = clock; c.SweepInterval = time.Hour })
+	ctx := context.Background()
+	e.mustSucceed(e.svc.Create(ctx, e.req(e.newKey()), api.CreateVMRequest{Name: "gone"}))
+	gone := e.vm("gone").ID
+	if err := e.db.Tx(ctx, func(tx *state.Tx) error {
+		if err := tx.PutProcess(&state.ProcessRecord{ID: "proc_1", VMID: gone, Owner: owner, Generation: 1, CreatedAt: now, Status: "exited"}); err != nil {
+			return err
+		}
+		if err := tx.PutConversation(&state.ConversationRecord{ID: "conv_1", VMID: gone, Owner: owner, CreatedAt: now, UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.PutPrompt(&state.PromptRecord{ID: "prm_1", ConversationID: "conv_1", VMID: gone, Owner: owner, State: "succeeded", CreatedAt: now})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.mustSucceed(e.svc.Delete(ctx, e.req(""), "gone"))
+	ttl := int64(60)
+	e.mustSucceed(e.svc.Create(ctx, e.req(e.newKey()), api.CreateVMRequest{Name: "ttl", TTLSeconds: &ttl}))
+	mu.Lock()
+	now = now.Add(25 * time.Hour) // past the TTL and the 24h tombstone retention
+	mu.Unlock()
+	if err := e.svc.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if id := e.vm("ttl").ActiveOperationID; id != "" {
+		e.wait(id)
+	}
+	if s := e.vm("ttl").State; s != domain.StateStopped {
+		t.Fatalf("expired VM is %s", s)
+	}
+	e.db.Tx(ctx, func(tx *state.Tx) error {
+		if _, err := tx.GetVM(gone); err == nil {
+			t.Error("tombstone not purged")
+		}
+		if p, _ := tx.GetProcess("proc_1"); p != nil {
+			t.Error("process of a purged VM kept")
+		}
+		if c, _ := tx.GetConversation("conv_1"); c != nil {
+			t.Error("conversation of a purged VM kept")
+		}
+		return nil
+	})
+}
+
 // TestTurnLeaseHoldsAutoStop: an active prompt turn's lease defers the TTL
 // stop until it ends; then the expired VM stops on the next sweep.
 func TestTurnLeaseHoldsAutoStop(t *testing.T) {

@@ -204,6 +204,89 @@ func TestInstallHost(t *testing.T) {
 	}
 }
 
+// TestInstallHostUpgradesService: an installed davit.service whose binary and
+// config are not the defaults is the install a rerun upgrades: the binary is
+// replaced where the unit runs it, its config and data dir are kept (no new
+// init), the daemon is awaited on the socket that config names, the replaced
+// image's rootfs blob goes and its kernel stays; an
+// --install-dir that disagrees with the unit is refused before anything changes.
+func TestInstallHostUpgradesService(t *testing.T) {
+	requireTools(t)
+	h := newHostFixture(t)
+	xdg := h.env["XDG_CONFIG_HOME"]
+	bin := filepath.Join(h.home, ".svm", "davit", "bin", "davit")
+	cfg := filepath.Join(xdg, "davit-host", "config.json")
+	data := filepath.Join(h.home, ".svm", "old data")
+	oldRootfs, kernel := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	manifest := filepath.Join(data, "images", "manifests", "ubuntu-24.04-dev.json")
+	for p, body := range map[string]string{
+		bin: "#!/bin/sh\necho old\n",
+		cfg: "{\n  \"dataDir\": \"" + data + "\",\n  \"socket\": \"" + data + "/davit.sock\",\n  \"images\": [\n    {\n      \"manifest\": \"" + manifest + "\"\n    }\n  ]\n}\n",
+		filepath.Join(xdg, "systemd", "user", "davit.service"): "[Service]\nExecStart=\"" + bin + "\" daemon --config \"" + cfg + "\"\n",
+		manifest: "{\n  \"kernel\": {\n    \"digest\": \"sha256:" + kernel + "\"\n  },\n  \"rootfs\": {\n    \"digest\": \"sha256:" + oldRootfs + "\",\n" +
+			"    \"packageList\": {\n      \"digest\": \"sha256:" + strings.Repeat("c", 64) + "\"\n    }\n  }\n}\n",
+		filepath.Join(data, "images", "blobs", "sha256", oldRootfs): "old rootfs",
+		filepath.Join(data, "images", "blobs", "sha256", kernel):    "old kernel",
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keepCfg, _ := os.ReadFile(cfg)
+
+	out, err := h.runHost(t, nil, "--install-dir", filepath.Join(h.home, ".local", "bin"))
+	if err == nil || !strings.Contains(out, "rerun without --install-dir") {
+		t.Fatalf("want a refusal of the other --install-dir, got %v\n%s", err, out)
+	}
+	if b, _ := os.ReadFile(bin); string(b) != "#!/bin/sh\necho old\n" {
+		t.Fatal("the refused install replaced the binary")
+	}
+
+	out, err = h.runHost(t, map[string]string{"DAVIT_INSTALL_DIR": ""})
+	if err != nil {
+		t.Fatalf("upgrade: %v\n%s", err, out)
+	}
+	if b, _ := os.ReadFile(bin); !strings.Contains(string(b), "FAKE_LOG") {
+		t.Fatalf("binary not upgraded in place at %s\n%s", bin, out)
+	}
+	if b, _ := os.ReadFile(cfg); string(b) != string(keepCfg) {
+		t.Fatalf("config changed:\n%s", b)
+	}
+	calls := h.calls(t)
+	for _, want := range []string{"davit init --config " + cfg + " --service", "davit doctor --config " + cfg,
+		"davit --api-url unix://" + data + "/davit.sock capabilities"} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("missing call %q:\n%s", want, calls)
+		}
+	}
+	if strings.Contains(calls, "--data-dir") {
+		t.Fatalf("an upgrade ran a new init:\n%s", calls)
+	}
+	if _, err := os.Stat(filepath.Join(xdg, "davit", "config.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a second config was written (stat err=%v)", err)
+	}
+	if _, err := os.Stat(h.manifest()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the image went to --data-dir, not the existing config's data dir")
+	}
+	if b, _ := os.ReadFile(manifest); !strings.Contains(string(b), `"name":"ubuntu-24.04-dev"`) {
+		t.Fatalf("image not replaced in the existing data dir:\n%s", b)
+	}
+	if _, err := os.Stat(filepath.Join(data, "images", "blobs", "sha256", oldRootfs)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the replaced rootfs blob was kept")
+	}
+	if _, err := os.Stat(filepath.Join(data, "images", "blobs", "sha256", kernel)); err != nil {
+		t.Fatal("the old kernel blob was removed")
+	}
+	for _, want := range []string{"keeping the data dir of the existing config", "doctor --config '" + cfg + "'"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // A failing doctor at the end fails the install.
 func TestInstallHostDoctorFails(t *testing.T) {
 	requireTools(t)
