@@ -16,16 +16,17 @@ AppArmor setting). The installer prints exactly what to run and runs it only if 
 1. **On the host** (a Linux x86_64 box with KVM):
 
    ```sh
-   curl -fsSL https://github.com/jayleaton/davit/releases/latest/download/install.sh | sh -s -- --host
+   curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc4/install.sh | sh -s -- --host
    ```
 
-   This installs davit and a prebuilt developer image, starts the service and checks the host with
+   Davit has release candidates only so far, so the commands name the current one (`releases/latest` starts
+   working with v0.1.0). This installs davit and a prebuilt developer image, starts the service and checks the host with
    `davit doctor`. Requirements and fixes: [docs/install-host.md](docs/install-host.md).
 
 2. **On your laptop** (macOS or Linux):
 
    ```sh
-   curl -fsSL https://github.com/jayleaton/davit/releases/latest/download/install.sh | sh -s -- --client
+   curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc4/install.sh | sh -s -- --client
    davit connect you@your-host
    ```
 
