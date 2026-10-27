@@ -30,7 +30,7 @@ each one it prints the exact command and why, then stops so you can run them and
 On the host:
 
 ```sh
-curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc5/install.sh | sh -s -- --host
+curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc6/install.sh | sh -s -- --host
 ```
 
 This installs `davit` and a prebuilt developer image (Ubuntu 24.04 with Go, Node.js, pnpm, uv, mise and
@@ -49,7 +49,7 @@ failure (`✗`) or warning (`!`), each followed by its fix. `davit doctor -v` li
 On your laptop:
 
 ```sh
-curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc5/install.sh | sh -s -- --client
+curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc6/install.sh | sh -s -- --client
 ```
 
 This installs only the `davit` CLI (into `~/.local/bin` by default). It installs no daemon and no images. On

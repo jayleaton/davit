@@ -8,15 +8,28 @@ umask 022
 export DEBIAN_FRONTEND=noninteractive
 P=/.provision
 
-apt-get update -q
-apt-get -y -q dist-upgrade
+# The pinned snapshot mirror answers 502/503 for minutes at a time, and apt does not retry HTTP
+# errors: rerun a failed apt-get (archives it already fetched stay in its cache) after 30 s,
+# 60 s, ... 210 s, about 14 minutes in all.
+apt_get() {
+  local n
+  for n in 1 2 3 4 5 6 7; do
+    apt-get "$@" && return 0
+    echo "provision: apt-get $* failed (attempt $n), retrying in $((n * 30)) s" >&2
+    sleep $((n * 30))
+  done
+  apt-get "$@"
+}
+
+apt_get update -q
+apt_get -y -q dist-upgrade
 mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$P/packages.txt")
-apt-get -y -q install "${pkgs[@]}"
+apt_get -y -q install "${pkgs[@]}"
 # A derived image's own packages.txt (same format), also from the pinned snapshot: its layer.sh
 # runs after the sources point at the live archive, so it must not apt-get itself.
 if [[ -f $P/layer/packages.txt ]]; then
   mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$P/layer/packages.txt")
-  [[ ${#pkgs[@]} -eq 0 ]] || apt-get -y -q install --no-install-recommends "${pkgs[@]}"
+  [[ ${#pkgs[@]} -eq 0 ]] || apt_get -y -q install --no-install-recommends "${pkgs[@]}"
 fi
 
 # Docker CE from download.docker.com, every package version pinned (that repo has no snapshots).
@@ -29,8 +42,8 @@ Components: stable
 Architectures: $DEB_ARCH
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-apt-get update -q
-apt-get -y -q install \
+apt_get update -q
+apt_get -y -q install \
   "docker-ce=$DOCKER_CE_VERSION" "docker-ce-cli=$DOCKER_CE_VERSION" "containerd.io=$CONTAINERD_VERSION" \
   "docker-buildx-plugin=$DOCKER_BUILDX_VERSION" "docker-compose-plugin=$DOCKER_COMPOSE_VERSION"
 dpkg-query -W -f '${Package}\t${Version}\t${Architecture}\n' | LC_ALL=C sort >"$P/packages.lock"
