@@ -255,3 +255,53 @@ func TestManifestCatalogAgentProtocolSkew(t *testing.T) {
 		t.Fatalf("warnings = %q", w)
 	}
 }
+
+// TestManifestCatalogRetired: a manifest an upgrade replaced is still found
+// by ID (the VMs and snapshots made from it boot with its kernel), even
+// without its rootfs, but it is never listed, the default or a name's image;
+// one whose kernel is gone is a warning, not a failed start.
+func TestManifestCatalogRetired(t *testing.T) {
+	ctx := context.Background()
+	dir, blobs := t.TempDir(), t.TempDir()
+	cur, _ := writeManifest(t, dir, blobs, "dev", "x86_64", "kernel-new", "rootfs-new")
+	retiredDir := RetiredDir(t.TempDir())
+	os.MkdirAll(retiredDir, 0o755)
+	old, oldID := writeManifest(t, retiredDir, blobs, "dev-old", "x86_64", "kernel-old", "rootfs-old")
+	// The old manifest keeps the current one's name, as a replaced image does.
+	raw, _ := os.ReadFile(old)
+	os.WriteFile(old, []byte(strings.Replace(string(raw), `"name":"dev-old"`, `"name":"dev"`, 1)), 0o644)
+	var m struct {
+		Rootfs struct{ Digest string } `json:"rootfs"`
+	}
+	json.Unmarshal(raw, &m)
+	os.Remove(filepath.Join(blobs, "sha256", strings.TrimPrefix(m.Rootfs.Digest, "sha256:"))) // dropped by the upgrade
+	broken, _ := writeManifest(t, retiredDir, t.TempDir(), "gone", "x86_64", "k", "r")
+
+	cat, err := LoadManifestCatalog(ctx, filepath.Join(dir, "cache"), ManifestSource{cur, blobs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.LoadRetired(ctx, filepath.Join(dir, "cache"), ManifestSource{old, blobs}, ManifestSource{broken, blobs}); err != nil {
+		t.Fatal(err)
+	}
+	id := domain.ImageID("img_" + strings.TrimPrefix(oldID, "sha256:")[:16])
+	img, err := cat.Get(ctx, id)
+	if err != nil || img.Kernel == "" || img.Rootfs != "" || img.Ref != "dev" {
+		t.Fatalf("retired image by ID: %+v %v", img, err)
+	}
+	if def, _ := cat.Resolve(ctx, ""); def.ID == id {
+		t.Fatal("a retired image is the default")
+	}
+	if byName, _ := cat.Resolve(ctx, "dev"); byName.ID == id {
+		t.Fatal("a retired image answers its name")
+	}
+	if _, err := cat.Resolve(ctx, string(id)); err == nil {
+		t.Fatal("a retired image is resolvable for a create")
+	}
+	if list, _ := cat.List(ctx); len(list) != 1 {
+		t.Fatalf("listed %d images, want only the current one", len(list))
+	}
+	if w := strings.Join(cat.Warnings(), "\n"); !strings.Contains(w, "retired image manifest "+broken) {
+		t.Fatalf("no warning for the unloadable retired manifest: %q", w)
+	}
+}

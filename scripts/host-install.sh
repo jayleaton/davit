@@ -158,7 +158,13 @@ remote_install() {
 		if ! cmp -s "$fs/manifests/$i.json" "$data/images/manifests/$i.json"; then
 			# The rootfs the replaced version used: only its creates and its goldens read it
 			# (a resume boots the VM's own committed disk; kernels are kept for those).
-			[ ! -f "$data/images/manifests/$i.json" ] || old_rootfs+=("$(rootfs_digest "$data/images/manifests/$i.json")")
+			if [ -f "$data/images/manifests/$i.json" ]; then
+				old_rootfs+=("$(rootfs_digest "$data/images/manifests/$i.json")")
+				# Kept by ID: the VMs and snapshots made from it still resolve it (lifecycle.RetiredDir).
+				h=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"].split(":")[1])' "$data/images/manifests/$i.json")
+				mkdir -p "$data/images/retired"
+				[ -f "$data/images/retired/$h.json" ] || cp "$data/images/manifests/$i.json" "$data/images/retired/$h.json"
+			fi
 			cp "$fs/manifests/$i.json" "$data/images/manifests/.$i.json.part"
 			mv "$data/images/manifests/.$i.json.part" "$data/images/manifests/$i.json"
 			changed=1

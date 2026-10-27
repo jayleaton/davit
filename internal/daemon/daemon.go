@@ -634,7 +634,26 @@ func newCatalog(ctx context.Context, cfg config.Daemon) (lifecycle.ImageCatalog,
 		}
 	}
 	if len(src) > 0 {
-		return lifecycle.LoadManifestCatalog(ctx, filepath.Join(cfg.DataDir, "images", "cache"), src...)
+		cache := filepath.Join(cfg.DataDir, "images", "cache")
+		cat, err := lifecycle.LoadManifestCatalog(ctx, cache, src...)
+		if err != nil {
+			return nil, err
+		}
+		// The images upgrades replaced, for the VMs and snapshots made from them.
+		dir := filepath.Join(cfg.DataDir, "images")
+		retired, err := filepath.Glob(filepath.Join(lifecycle.RetiredDir(dir), "*.json"))
+		if err != nil {
+			return nil, err
+		}
+		slices.Sort(retired)
+		var rs []lifecycle.ManifestSource
+		for _, m := range retired {
+			rs = append(rs, lifecycle.ManifestSource{Manifest: m, BlobDir: filepath.Join(dir, "blobs")})
+		}
+		if err := cat.LoadRetired(ctx, cache, rs...); err != nil {
+			return nil, err
+		}
+		return cat, nil
 	}
 	if cfg.Runtime != "fake" {
 		return nil, fmt.Errorf("no images: put a manifest in %s (blobs in %s) or set images in the config",

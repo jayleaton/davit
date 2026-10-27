@@ -30,11 +30,53 @@ type ManifestSource struct {
 }
 
 // ManifestCatalog serves images from verified manifests; the first source is
-// the default image.
+// the default image. Retired images (manifests an upgrade replaced) are only
+// found by ID, for the VMs and snapshots created from them.
 type ManifestCatalog struct {
 	*StaticCatalog
 	warnings []string
+	retired  map[domain.ImageID]domain.Image
 }
+
+// Get returns a current image, else a retired one: a VM's resume and a
+// create from its snapshots boot the image it was created from, whose
+// kernel an upgrade keeps (its rootfs may be gone; neither reads it).
+func (c *ManifestCatalog) Get(ctx context.Context, id domain.ImageID) (domain.Image, error) {
+	img, err := c.StaticCatalog.Get(ctx, id)
+	if err == nil || !domain.IsCode(err, domain.CodeNotFound) {
+		return img, err
+	}
+	if r, ok := c.retired[id]; ok {
+		return r, nil
+	}
+	return img, err
+}
+
+// LoadRetired adds the manifests an upgrade replaced (see RetiredDir). Each
+// needs its kernel; its rootfs is optional. One that cannot be loaded is a
+// warning, never an error: the current images still serve.
+func (c *ManifestCatalog) LoadRetired(ctx context.Context, cacheDir string, srcs ...ManifestSource) error {
+	cache := loadVerifyCache(cacheDir)
+	for _, src := range srcs {
+		img, _, err := loadManifestAs(ctx, src, cache, true)
+		if err != nil {
+			c.warnings = append(c.warnings, fmt.Sprintf("retired image manifest %s: %v", src.Manifest, err))
+			continue
+		}
+		if _, err := c.StaticCatalog.Get(ctx, img.ID); err == nil {
+			continue // still current
+		}
+		if c.retired == nil {
+			c.retired = map[domain.ImageID]domain.Image{}
+		}
+		c.retired[img.ID] = img
+	}
+	return cache.save()
+}
+
+// RetiredDir is where an upgrade keeps the manifests it replaced, by ID
+// (<RetiredDir>/<hex>.json), next to the data dir's manifests and blobs.
+func RetiredDir(imagesDir string) string { return filepath.Join(imagesDir, "retired") }
 
 // Warnings lists non-fatal problems found while loading, e.g. a baked guest
 // agent missing features this host uses ("minor" protocol skew). Fatal ones
@@ -106,6 +148,13 @@ func LoadManifestCatalog(ctx context.Context, cacheDir string, entries ...Manife
 // whose protocol cannot talk to this host is an error: every boot and golden
 // preparation would fail at the restore barrier, so refuse it up front.
 func loadManifest(ctx context.Context, src ManifestSource, cache *verifyCache) (img domain.Image, warning string, err error) {
+	return loadManifestAs(ctx, src, cache, false)
+}
+
+// loadManifestAs loads a current manifest, or with retired one an upgrade
+// replaced: its rootfs may be gone (Rootfs is then "") and its guest agent
+// already ran on this host, so neither is checked.
+func loadManifestAs(ctx context.Context, src ManifestSource, cache *verifyCache, retired bool) (img domain.Image, warning string, err error) {
 	f, err := os.Open(src.Manifest)
 	if err != nil {
 		return domain.Image{}, "", err
@@ -147,12 +196,14 @@ func loadManifest(ctx context.Context, src ManifestSource, cache *verifyCache) (
 		return domain.Image{}, "", err
 	}
 	rootfs, err := cache.verify(ctx, src.BlobDir, "rootfs", m.Rootfs.Digest, m.Rootfs.Size)
-	if err != nil {
+	if err != nil && !retired {
 		return domain.Image{}, "", err
+	} else if err != nil {
+		rootfs = ""
 	}
 	// Images without a recorded agent (dev images, agents injected later) are
 	// left to the handshake; preflight warns about them separately.
-	if m.Guest.Agent.Binary != nil {
+	if m.Guest.Agent.Binary != nil && !retired {
 		switch c, msg := guestclient.CheckAgent(m.Guest.Agent.Protocol); c {
 		case guestclient.CompatIncompatible:
 			return domain.Image{}, "", fmt.Errorf("%s (agent %s): %s", m.Name, m.Guest.Agent.Version, msg)

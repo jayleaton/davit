@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"davit/internal/buildinfo"
@@ -199,8 +200,8 @@ type sshConn struct {
 	stderr *limitedBuffer
 	exited chan struct{}
 	waitMu sync.Mutex
-	err    error // the session's exit, once exited is closed
-	read   bool  // some data arrived
+	err    error       // the session's exit, once exited is closed
+	read   atomic.Bool // some data arrived
 	close  sync.Once
 }
 
@@ -247,9 +248,9 @@ func dialSSH(ctx context.Context, bin string, args []string, host string) (net.C
 func (c *sshConn) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
-		c.read = true
+		c.read.Store(true)
 	}
-	if err != nil && !c.read && !errors.Is(err, os.ErrDeadlineExceeded) {
+	if err != nil && !c.read.Load() && !errors.Is(err, os.ErrDeadlineExceeded) {
 		return n, c.failure(err)
 	}
 	return n, err
@@ -277,7 +278,16 @@ func (c *sshConn) failure(err error) error {
 	return sshFailure(classifySSH(msg, exit), c.host, msg)
 }
 
-func (c *sshConn) Write(p []byte) (int, error) { return c.w.Write(p) }
+// Write sends to the session. One that already ended before any data (the
+// remote exited first: no davit there, or ssh failed) is explained like a
+// failed read, not reported as a bare broken pipe.
+func (c *sshConn) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if err != nil && !c.read.Load() && !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, os.ErrClosed) {
+		return n, c.failure(err)
+	}
+	return n, err
+}
 
 // CloseWrite ends the session's stdin (the host side half-closes the
 // daemon connection in turn).

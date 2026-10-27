@@ -208,7 +208,8 @@ func TestInstallHost(t *testing.T) {
 // config are not the defaults is the install a rerun upgrades: the binary is
 // replaced where the unit runs it, its config and data dir are kept (no new
 // init), the daemon is awaited on the socket that config names, the replaced
-// image's rootfs blob goes and its kernel stays; an
+// image's manifest is kept by ID (images/retired) while its rootfs blob goes
+// and its kernel stays; an
 // --install-dir that disagrees with the unit is refused before anything changes.
 func TestInstallHostUpgradesService(t *testing.T) {
 	requireTools(t)
@@ -217,13 +218,13 @@ func TestInstallHostUpgradesService(t *testing.T) {
 	bin := filepath.Join(h.home, ".svm", "davit", "bin", "davit")
 	cfg := filepath.Join(xdg, "davit-host", "config.json")
 	data := filepath.Join(h.home, ".svm", "old data")
-	oldRootfs, kernel := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	oldRootfs, kernel, oldID := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("d", 64)
 	manifest := filepath.Join(data, "images", "manifests", "ubuntu-24.04-dev.json")
 	for p, body := range map[string]string{
 		bin: "#!/bin/sh\necho old\n",
 		cfg: "{\n  \"dataDir\": \"" + data + "\",\n  \"socket\": \"" + data + "/davit.sock\",\n  \"images\": [\n    {\n      \"manifest\": \"" + manifest + "\"\n    }\n  ]\n}\n",
 		filepath.Join(xdg, "systemd", "user", "davit.service"): "[Service]\nExecStart=\"" + bin + "\" daemon --config \"" + cfg + "\"\n",
-		manifest: "{\n  \"kernel\": {\n    \"digest\": \"sha256:" + kernel + "\"\n  },\n  \"rootfs\": {\n    \"digest\": \"sha256:" + oldRootfs + "\",\n" +
+		manifest: "{\n  \"id\": \"sha256:" + oldID + "\",\n  \"kernel\": {\n    \"digest\": \"sha256:" + kernel + "\"\n  },\n  \"rootfs\": {\n    \"digest\": \"sha256:" + oldRootfs + "\",\n" +
 			"    \"packageList\": {\n      \"digest\": \"sha256:" + strings.Repeat("c", 64) + "\"\n    }\n  }\n}\n",
 		filepath.Join(data, "images", "blobs", "sha256", oldRootfs): "old rootfs",
 		filepath.Join(data, "images", "blobs", "sha256", kernel):    "old kernel",
@@ -243,6 +244,13 @@ func TestInstallHostUpgradesService(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(bin); string(b) != "#!/bin/sh\necho old\n" {
 		t.Fatal("the refused install replaced the binary")
+	}
+	out, err = h.runHost(t, map[string]string{"DAVIT_INSTALL_DIR": "", "FAKE_DF_AVAIL_KIB": "3145728"})
+	if err == nil || !strings.Contains(out, "this upgrade (nothing was changed) stops here") {
+		t.Fatalf("want a low-disk refusal of the upgrade, got %v\n%s", err, out)
+	}
+	if b, _ := os.ReadFile(bin); string(b) != "#!/bin/sh\necho old\n" {
+		t.Fatal("a low-disk refusal replaced the binary")
 	}
 
 	out, err = h.runHost(t, map[string]string{"DAVIT_INSTALL_DIR": ""})
@@ -277,6 +285,9 @@ func TestInstallHostUpgradesService(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(data, "images", "blobs", "sha256", oldRootfs)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("the replaced rootfs blob was kept")
 	}
+	if b, _ := os.ReadFile(filepath.Join(data, "images", "retired", oldID+".json")); !strings.Contains(string(b), oldRootfs) {
+		t.Fatalf("the replaced manifest was not kept in images/retired/<id>.json: %q", b)
+	}
 	if _, err := os.Stat(filepath.Join(data, "images", "blobs", "sha256", kernel)); err != nil {
 		t.Fatal("the old kernel blob was removed")
 	}
@@ -298,7 +309,7 @@ func TestInstallHostDoctorFails(t *testing.T) {
 }
 
 // TestInstallHostLowDisk: too little room for the image stops the install
-// before any download, naming the data dir and --data-dir.
+// before anything is installed or downloaded, naming the data dir and --data-dir.
 func TestInstallHostLowDisk(t *testing.T) {
 	requireTools(t)
 	h := newHostFixture(t)
@@ -308,6 +319,9 @@ func TestInstallHostLowDisk(t *testing.T) {
 	}
 	if strings.Contains(out, "image ubuntu-24.04-dev") {
 		t.Fatalf("an image was installed despite the refusal:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(h.installDir, "davit")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the refused install left a binary (stat err=%v)", err)
 	}
 }
 

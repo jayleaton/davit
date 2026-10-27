@@ -251,6 +251,9 @@ install_image() {
 		_dst=$DATA/images/blobs/sha256/${_b##*/}
 		[ -e "$_dst" ] || mv "$_b" "$_dst" || die "cannot install blob $_dst"
 	done
+	if [ -f "$DATA/images/manifests/$_name.json" ]; then
+		retire_manifest "$DATA/images/manifests/$_name.json"
+	fi
 	mv -f "$IMG_STAGE/x/manifests/$_name.json" "$DATA/images/manifests/$_name.json" || die "cannot install the manifest"
 	printf '%s\n' "$_want" >"$_mark"
 	rm -rf "$IMG_STAGE"
@@ -264,6 +267,22 @@ install_image() {
 # names none).
 rootfs_digest() {
 	sed -n '/"rootfs": *{/,/"digest"/ s/.*"digest": *"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# manifest_id MANIFEST: the hex of the manifest's own "id" (nothing when it has none).
+manifest_id() {
+	sed -n 's/^ *"id": *"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# retire_manifest MANIFEST: keep a manifest an upgrade replaces as $DATA/images/retired/<id>.json.
+# The daemon still resolves it by ID, so the VMs and snapshots made from it resume and clone
+# (they boot their own disks with its kernel, which stays); it is never a create's image.
+retire_manifest() {
+	_rid=$(manifest_id "$1")
+	[ -n "$_rid" ] || return 0
+	mkdir -p "$DATA/images/retired" || die "cannot create $DATA/images/retired"
+	[ -f "$DATA/images/retired/$_rid.json" ] || cp "$1" "$DATA/images/retired/$_rid.json" ||
+		die "cannot keep the replaced manifest $1"
 }
 
 # drop_rootfs HEX: remove a replaced image's rootfs blob when no manifest in the data dir or
@@ -478,11 +497,8 @@ install_host() {
 	UNIT=$_xdg/systemd/user/$NAME.service
 	DEFAULT_CONFIG=$CONFIG
 	existing_install
-	install_binary
-
-	# 1. Configuration (no large downloads yet). The runtime is firecracker: a host whose KVM
-	#    is broken gets fixes and a failing doctor, never simulated VMs (--fake-runtime is
-	#    for development only).
+	# The data dir and its free space are known before anything changes: a host that is
+	# refused (too little room) keeps its binary, config and service as they were.
 	if [ -f "$CONFIG" ]; then
 		DATA=$(config_field "$CONFIG" dataDir)
 		[ -n "$DATA" ] || die "cannot read dataDir from $CONFIG"
@@ -497,6 +513,19 @@ install_host() {
 		fi
 		case "$DATA" in /*) ;; *) die "--data-dir must be an absolute path" ;; esac
 	fi
+	if [ "$RUNTIME" != fake ]; then
+		_free=$(free_kib "$DATA")
+		if [ "$_free" -lt $((10 * 1024 * 1024)) ]; then
+			_what="a new install"
+			if [ -f "$CONFIG" ]; then _what="this upgrade (nothing was changed)"; fi
+			die "$DATA has $((_free / 1024 / 1024)) GiB free; the image and VM disks need at least 10 GiB, so $_what stops here. Free space or rerun with --data-dir on a bigger disk."
+		fi
+	fi
+	install_binary
+
+	# 1. Configuration (no large downloads yet). The runtime is firecracker: a host whose KVM
+	#    is broken gets fixes and a failing doctor, never simulated VMs (--fake-runtime is
+	#    for development only).
 
 	if [ ! -f "$CONFIG" ]; then
 		set -- init --config "$CONFIG" --data-dir "$DATA" --runtime "$RUNTIME"
@@ -513,16 +542,11 @@ install_host() {
 	fi
 
 	# 2. Host prerequisites before any large download: the root fixes `davit doctor` knows
-	#    (KVM access, AppArmor, namespaces, TUN), then the space the image needs.
+	#    (KVM access, AppArmor, namespaces, TUN); the space was checked first.
 	davit_run doctor --config "$CONFIG" --fixes >"$TMP_DIR/fixes" || die "$NAME doctor --fixes failed"
 	root_fixes "$TMP_DIR/fixes"
 
 	if [ "$RUNTIME" != fake ]; then
-		_need=$((10 * 1024 * 1024))
-		_free=$(free_kib "$DATA")
-		if [ "$_free" -lt "$_need" ]; then
-			die "$DATA has $((_free / 1024 / 1024)) GiB free; the image and VM disks need at least 10 GiB. Free space or rerun with --data-dir on a bigger disk."
-		fi
 		[ -n "$IMAGES" ] || IMAGES=$DEFAULT_IMAGE
 		for _img in $IMAGES; do
 			install_image "$_img"

@@ -374,6 +374,8 @@ func (s *Service) runBoot(ctx context.Context, op *domain.Operation) (*domain.Op
 			return nil, err
 		}
 		_, err = s.cfg.Storage.CloneCommitted(ctx, storage.CommitID(snap.CommitID), disk, rec.VM.Shape.DiskBytes)
+	} else if img.Rootfs == "" {
+		err = domain.Errorf(domain.CodeNotFound, "image %s was replaced by an upgrade and its root filesystem is gone; create from the current image", img.ID)
 	} else {
 		_, err = s.cfg.Storage.CreateWritable(ctx, disk, img.Rootfs, rec.VM.Shape.DiskBytes)
 	}
