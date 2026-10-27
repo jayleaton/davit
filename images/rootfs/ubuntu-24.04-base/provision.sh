@@ -10,7 +10,8 @@ P=/.provision
 
 # The pinned snapshot mirror answers 502/503 for minutes at a time, and apt does not retry HTTP
 # errors: rerun a failed apt-get (archives it already fetched stay in its cache) after 30 s,
-# 60 s, ... 210 s, about 14 minutes in all.
+# 60 s, ... 210 s, about 14 minutes in all. `update` needs --error-on=any: by default a 5xx on an
+# index is a warning, update exits 0 and every install after it finds no packages.
 apt_get() {
   local n
   for n in 1 2 3 4 5 6 7; do
@@ -21,7 +22,7 @@ apt_get() {
   apt-get "$@"
 }
 
-apt_get update -q
+apt_get update -q --error-on=any
 apt_get -y -q dist-upgrade
 mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$P/packages.txt")
 apt_get -y -q install "${pkgs[@]}"
@@ -42,7 +43,7 @@ Components: stable
 Architectures: $DEB_ARCH
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-apt_get update -q
+apt_get update -q --error-on=any
 apt_get -y -q install \
   "docker-ce=$DOCKER_CE_VERSION" "docker-ce-cli=$DOCKER_CE_VERSION" "containerd.io=$CONTAINERD_VERSION" \
   "docker-buildx-plugin=$DOCKER_BUILDX_VERSION" "docker-compose-plugin=$DOCKER_COMPOSE_VERSION"

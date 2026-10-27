@@ -34,11 +34,11 @@ inner_ensure() {
   apt_setup "$BROOT" "$HOST_DEB_ARCH"
   ln -sfn /proc/self/mounts "$BROOT/etc/mtab" # mke2fs checks it before writing an image
   chroot_mount "$BROOT"
-  # A failed apt-get reruns after 30 s, 60 s, ... (provision.sh's apt_get).
+  # A failed apt-get reruns after 30 s, 60 s, ...; update fails on any index error (provision.sh's apt_get).
   # shellcheck disable=SC2016 # expands inside the chroot's shell
   chroot "$BROOT" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive \
     /bin/sh -euxc 'r() { n=0; until apt-get "$@"; do n=$((n + 1)); [ $n -le 7 ] || exit 1; sleep $((n * 30)); done; }
-      r update -q; r -y -q dist-upgrade; r -y -q install "$@"; apt-get clean' \
+      r update -q --error-on=any; r -y -q dist-upgrade; r -y -q install "$@"; apt-get clean' \
     sh "${PKGS[@]}"
   # Pinned mke2fs -> /opt/e2fsprogs/sbin (static against e2fsprogs' own libs).
   mkdir -p "$BROOT/src"
