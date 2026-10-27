@@ -25,6 +25,9 @@ export type Consistency = "clean" | "crash" | (string & {});
 
 export type Arch = "amd64" | "arm64" | (string & {});
 
+/** Storage tier holding a VM's committed disk (docs/storage-tiers.md): `hot` is the data dir's filesystem, `cold` the optional slower, larger one stopped VMs move to when unused. VM.tier is `cold` once the host moved the stopped VM there, so the next resume copies it back first (VM.coldBytes); absent means hot. */
+export type StorageTier = "hot" | "cold" | (string & {});
+
 /**
  * Stable machine-readable error code. HTTP status mapping: 400
  * invalid_argument; 401 unauthenticated; 403 permission_denied; 404
@@ -86,6 +89,18 @@ export interface HostCapacity {
   freeMemoryBytes: number;
   /** Free space of the data dir. */
   freeDiskBytes: number;
+  /** Size of the data dir's filesystem; absent where not measured. */
+  totalDiskBytes?: number;
+  /** Free-space floor admission keeps: the larger of `limits.minFreeDiskBytes` and `limits.minFreeDiskPercent` of the filesystem. Below it new, fork and resume are refused or queued and the low-disk cleanup runs. Absent when disabled or not measured. */
+  diskFloorBytes?: number;
+  /** Growth headroom reserved for VMs still provisioning, counted as used by admission. */
+  diskReservedBytes?: number;
+  /** Free space admission reserves for a VM of the default shape to grow into (`limits.diskHeadroomPercent` of its disk size). */
+  diskHeadroomBytes?: number;
+  /** Space set aside so that stopping (committing) a running VM never fails for lack of space. */
+  saveReserveBytes?: number;
+  /** False while a stop is using the save reserve (or it could not be set aside). */
+  saveReserveArmed?: boolean;
   allocated: Shape;
   limits: Limits;
   /** VMs holding a slot (provisioning to stopping). */
@@ -100,6 +115,33 @@ export interface HostCapacity {
   reclaimable: number;
   /** Requests queued for capacity (`waitSeconds`), first in line first. */
   waiting: CapacityWaiter[];
+  cold?: ColdCapacity;
+}
+
+/** The cold storage tier (docs/storage-tiers.md): the filesystem stopped VMs unused for `afterSeconds` move to. Absent from HostCapacity when none is configured and no VM is on one. */
+export interface ColdCapacity {
+  /** Free space of the cold filesystem. */
+  freeBytes: number;
+  /** Size of the cold filesystem; absent where not measured. */
+  totalBytes?: number;
+  /** Free space moving VMs to cold storage keeps there (`coldStorage.minFreeBytes` / `minFreePercent` of its size). */
+  floorBytes?: number;
+  /** How long a stopped VM must be unused before the host moves it to cold storage. */
+  afterSeconds: number;
+  /** VMs on cold storage. */
+  vms: number;
+  /** Data of the VMs on cold storage. */
+  bytes: number;
+  /** Whether the cold filesystem supports reflink copies. */
+  fastClone: boolean;
+  /** The reflink probe's detail. */
+  detail?: string;
+  /** True when the cold directory is on the data dir's own filesystem: moving VMs there frees nothing. */
+  sameFilesystem?: boolean;
+  /** True while the tier is being emptied (`coldStorage.drain`): nothing moves there and cold VMs come back. */
+  draining?: boolean;
+  /** Why the cold tier is not in use although VMs are on it (its disk is missing, or it is no longer configured); they cannot resume until it is back. */
+  unavailable?: string;
 }
 
 export interface CapacityWaiter {
@@ -107,6 +149,10 @@ export interface CapacityWaiter {
   ticket: string;
   /** Memory the request needs (0 if not known). */
   memoryBytes: number;
+  /** What the request's last refusal was for: `memory`, `vms`, `cpu` or `disk` (free space); absent before it was refused. */
+  resource?: string;
+  /** Free space it needs (its growth headroom, the headroom reserved for VMs starting, and the floor) when it waits for disk space. */
+  diskBytes?: number;
   /** ISO 8601 / RFC 3339 UTC timestamp string. */
   since: string;
 }
@@ -116,8 +162,14 @@ export interface Limits {
   cpus: number;
   memoryBytes: number;
   diskBytes: number;
-  /** Free-space floor of the data dir (0 = default, negative = disabled). */
+  /** Free-space floor of the data dir, at least this many bytes (0 = default 5 GiB, negative = no floor: disk admission and the low-disk cleanup off). */
   minFreeDiskBytes?: number;
+  /** Free-space floor as a share of the filesystem; the floor is the larger of the two (0 = default 10, negative = bytes only). */
+  minFreeDiskPercent?: number;
+  /** Share of a VM's disk size admission reserves for its private growth (0 = default 25, negative = none). */
+  diskHeadroomPercent?: number;
+  /** Space set aside (a reserve file) that only stops may use (0 = default 2 GiB, negative = none). */
+  saveReserveBytes?: number;
   /** Live VMs at once (0 = unlimited). */
   vms?: number;
   /** Host memory that must stay available after admitting a VM (0 = default, negative = disabled). */
@@ -283,6 +335,21 @@ export interface VM {
   labels?: Record<string, string>;
   /** Stops the VM (keeping its disk) after this long with no exec, attached process stream or tunnel (ssh) activity. Absent or 0: never. Independent of the TTL. */
   idleTimeoutSeconds?: number;
+  /** Pinned (`davit box pin`): never auto-deleted by the host's low-disk cleanup. On a project image's builder VM it pins the image. Moving to cold storage is separate (`keepHot`). */
+  keep?: boolean;
+  /** Kept on hot storage (`davit box pin --hot`): the host never moves the VM to its cold storage tier (docs/storage-tiers.md). */
+  keepHot?: boolean;
+  tier?: StorageTier;
+  /** The data a resume of a cold VM copies back to hot storage. */
+  coldBytes?: number;
+  /**
+   * When the VM went cold.
+   *
+   * ISO 8601 / RFC 3339 UTC timestamp string.
+   */
+  coldAt?: string;
+  /** On a deleted VM the host deleted on its own (the low-disk cleanup's auto-delete): why, with how long it was unused and the disk's state. Absent when its owner deleted it. */
+  deleteReason?: string;
   /**
    * Last activity the idle timeout counts from (this daemon run's exec, stream or tunnel use, or the VM's last state change); present on ready/running VMs with an idle timeout.
    *
@@ -358,6 +425,8 @@ export interface CreateVMRequest {
   labels?: Record<string, string>;
   /** Stop the VM after this long without activity (see VM.idleTimeoutSeconds). */
   idleTimeoutSeconds?: number;
+  /** Pin the VM (see VM.keep). */
+  keep?: boolean;
 }
 
 export interface ForkVMRequest {
@@ -390,6 +459,10 @@ export interface UpdateVMRequest {
   egress?: Egress;
   /** Replaces the idle timeout (0 disables it); the countdown restarts now. */
   idleTimeoutSeconds?: number;
+  /** Pins (true) or unpins the VM (see VM.keep). */
+  keep?: boolean;
+  /** True keeps the VM on hot storage (never moved to cold storage); false lets it go cold again (see VM.keepHot). */
+  keepHot?: boolean;
 }
 
 export interface StopVMRequest {
@@ -435,6 +508,46 @@ export interface ReclaimedVM {
   memoryBytes: number;
   /** The stop (absent with dryRun). */
   operationId?: string;
+}
+
+export interface PruneImagesRequest {
+  /** List what would be removed without removing it. */
+  dryRun?: boolean;
+}
+
+export interface PruneImagesResult {
+  dryRun: boolean;
+  /** The removed (or removable) blobs, least recently changed first. */
+  removed: PrunedBlob[];
+  /** Blobs that stay (referenced, or changed within the last hour). */
+  kept: number;
+  /** Space the removed blobs took on disk. */
+  bytes: number;
+}
+
+export interface PrunedBlob {
+  digest: string;
+  bytes: number;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  changedAt: string;
+}
+
+/** The data of a `vm.autodeleted` event: an unused box the host's low-disk cleanup deleted. */
+export interface AutoDeletion {
+  vmId: string;
+  name: string;
+  /** PROJECT/INSTANCE, or PROJECT for a project image. */
+  box: string;
+  /** `image` or `instance`. */
+  kind: string;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  lastUsedAt: string;
+  unusedSeconds: number;
+  /** Free space the deletion gave back as measured (data shared with other boxes stays). */
+  freedBytes: number;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  deletedAt: string;
+  reason: string;
 }
 
 export interface CreateVMsResult {
@@ -1013,7 +1126,7 @@ export interface TokenList {
 /**
  * One entry of the host event stream, in seq order. Types: vm.created, vm.state,
  * operation.created, operation.state, operation.progress, run.created, run.state,
- * prompt.created, prompt.state, golden.evicted; tolerate unknown types. data is an allowlisted summary
+ * prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion); tolerate unknown types. data is an allowlisted summary
  * (IDs, states, error codes): never environment values, prompt text or secrets.
  */
 export interface Event {

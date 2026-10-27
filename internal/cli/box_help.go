@@ -25,24 +25,29 @@ var boxSubs = []boxSub{
 	{"run", "[PROJECT[/INSTANCE]] [flags] -- COMMAND...", "sync this worktree into its box, run COMMAND there, stream its output; exits with COMMAND's status",
 		[]string{"cwd", "env", "e", "timeout", "stdin", "user", "raw", "no-sync", "no-up", "git", "wait", "image", "type", "cpus", "memory", "disk", "idle"}},
 	{"up", "[PROJECT[/INSTANCE]] [flags]", "create or start the box (the first time, the project image is built: dependencies installed once); --cpus/--memory/--disk resize it",
-		[]string{"refresh", "image", "type", "cpus", "memory", "disk", "idle", "wait", "no-wait", "wait-timeout", "idempotency-key"}},
+		[]string{"refresh", "image", "type", "cpus", "memory", "disk", "idle", "keep", "wait", "no-wait", "wait-timeout", "idempotency-key"}},
 	{"down", "[PROJECT[/INSTANCE]] [--force]", "stop the box; its disk is kept (it also stops by itself after 15 min unused)",
 		[]string{"force", "no-wait", "wait-timeout", "idempotency-key"}},
 	{"ssh", "[PROJECT[/INSTANCE]] [-- COMMAND...]", "a shell (or COMMAND) in the box over OpenSSH",
 		[]string{"user", "no-up", "wait"}},
 	{"sync", "[PROJECT[/INSTANCE]] [DIR[:GUEST_PATH]] | --pull GUEST_PATH [LOCAL]", "copy this worktree into the box (adds and replaces files), or --pull a path back out",
 		[]string{"pull", "git", "no-up", "wait"}},
-	{"ls", "[PROJECT]", "list boxes and project images, with the host's free capacity", nil},
+	{"ls", "[PROJECT] [--deleted]", "list boxes and project images (and whether each is on hot or cold storage), with the host's free memory and disk; --deleted: the boxes the host auto-deleted for disk space",
+		[]string{"deleted"}},
+	{"pin", "[PROJECT[/INSTANCE] | PROJECT/image] [--hot]", "keep the box (or project image) when the host is low on disk: unused boxes older than " +
+		"3 days (images without instances: 1 day; the host's defaults) can be auto-deleted then; pin to keep. --hot also keeps it on " +
+		"hot storage: a host with a cold storage tier never moves it there", []string{"hot"}},
+	{"unpin", "[PROJECT[/INSTANCE] | PROJECT/image]", "undo box pin (and --hot)", nil},
 	{"rm", "[PROJECT[/INSTANCE]] --yes", "delete the box and its disk", []string{"yes"}},
-	{"image", "build|update [PROJECT] [--from IMAGE] [--setup FILE | --setup-cmd CMD] [--dir DIR] | rm [PROJECT] [--force] --yes",
-		"build or update the project image (setup: " + defaultSetupFile + ", or detected from the repo), or remove it",
-		[]string{"from", "setup", "setup-cmd", "dir", "force", "yes", "type", "cpus", "memory", "disk"}},
+	{"image", "build|update [PROJECT] [--from IMAGE] [--setup FILE | --setup-cmd CMD] [--dir DIR] | rm [PROJECT] [--force] --yes | prune [--dry-run]",
+		"build or update the project image (setup: " + defaultSetupFile + ", or detected from the repo), or remove it; prune removes the host's image blobs no image uses (host owner)",
+		[]string{"from", "setup", "setup-cmd", "dir", "force", "yes", "type", "cpus", "memory", "disk", "dry-run"}},
 	{"gc", "[PROJECT] [--idle 10m] [--rm-older-than 7d] [--dry-run]", "stop idle boxes and delete long-stopped ones (never a project image)",
 		[]string{"idle", "rm-older-than", "dry-run"}},
 }
 
 // boxUsage is box's usage line.
-const boxUsage = "run|up|down|ssh|sync|ls|rm|image|gc [PROJECT[/INSTANCE]] [flags] (PROJECT/INSTANCE default to this repository and worktree)"
+const boxUsage = "run|up|down|ssh|sync|ls|rm|pin|unpin|image|gc [PROJECT[/INSTANCE]] [flags] (PROJECT/INSTANCE default to this repository and worktree)"
 
 // boxHelp prints box's help, for one subcommand when pos names one.
 func boxHelp(w io.Writer, fs *flag.FlagSet, pos []string) {

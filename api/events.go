@@ -24,6 +24,9 @@ const (
 	// of an image or project image) to keep free disk space; the next create
 	// that needs it captures it again.
 	EventGoldenEvicted = "golden.evicted"
+	// EventVMAutoDeleted: the host deleted an unused box to free disk space
+	// (the low-disk cleanup); data is an AutoDeletion.
+	EventVMAutoDeleted = "vm.autodeleted"
 )
 
 // Event is one entry of the host event stream. Seq orders events; Data is

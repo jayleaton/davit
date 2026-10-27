@@ -98,6 +98,22 @@ type HostCapacity struct {
 	FreeMemoryBytes int64 `json:"freeMemoryBytes"`
 	// FreeDiskBytes is the data dir's free space.
 	FreeDiskBytes int64 `json:"freeDiskBytes"`
+	// TotalDiskBytes is the size of the data dir's filesystem; 0 where not
+	// measured.
+	TotalDiskBytes int64 `json:"totalDiskBytes,omitempty"`
+	// DiskFloorBytes is the free-space floor admission keeps
+	// (Limits.DiskFloor); 0 when disabled or not measured.
+	DiskFloorBytes int64 `json:"diskFloorBytes,omitempty"`
+	// DiskReservedBytes is the growth headroom reserved for VMs still
+	// provisioning, counted as used by admission.
+	DiskReservedBytes int64 `json:"diskReservedBytes,omitempty"`
+	// DiskHeadroomBytes is what admission reserves for a VM of the default
+	// shape (Limits.DiskHeadroom).
+	DiskHeadroomBytes int64 `json:"diskHeadroomBytes,omitempty"`
+	// SaveReserveBytes is the space set aside for stops; SaveReserveArmed
+	// is false while a stop is using it (or it could not be set aside).
+	SaveReserveBytes int64 `json:"saveReserveBytes,omitempty"`
+	SaveReserveArmed bool  `json:"saveReserveArmed,omitempty"`
 	// Allocated is the shape sum of VMs holding resources (see Limits).
 	Allocated Shape `json:"allocated"`
 	// Limits are the administrator bounds (zero: unlimited).
@@ -119,6 +135,37 @@ type HostCapacity struct {
 	// Waiting are the createVM/resumeVM requests queued for capacity
 	// (waitSeconds), first in line first.
 	Waiting []CapacityWaiter `json:"waiting"`
+	// Cold is the cold storage tier; absent when none is configured.
+	Cold *ColdCapacity `json:"cold,omitempty"`
+}
+
+// ColdCapacity reports the cold storage tier (docs/storage-tiers.md):
+// the filesystem stopped VMs unused for AfterSeconds move to.
+type ColdCapacity struct {
+	// FreeBytes and TotalBytes measure the cold filesystem; FloorBytes is
+	// the free space demotion keeps there (Limits.DiskFloor of its size).
+	FreeBytes  int64 `json:"freeBytes"`
+	TotalBytes int64 `json:"totalBytes,omitempty"`
+	FloorBytes int64 `json:"floorBytes,omitempty"`
+	// AfterSeconds is how long a stopped VM must be unused before the host
+	// moves it to cold storage.
+	AfterSeconds int64 `json:"afterSeconds"`
+	// VMs is how many VMs are cold; Bytes is their data there.
+	VMs   int   `json:"vms"`
+	Bytes int64 `json:"bytes"`
+	// FastClone and Detail are the reflink probe on the cold filesystem.
+	FastClone bool   `json:"fastClone"`
+	Detail    string `json:"detail,omitempty"`
+	// SameFilesystem is true when the cold directory is on the data dir's
+	// own filesystem: moving VMs there frees nothing.
+	SameFilesystem bool `json:"sameFilesystem,omitempty"`
+	// Draining is true while the tier is being emptied
+	// (coldStorage.drain): nothing moves there, cold VMs come back.
+	Draining bool `json:"draining,omitempty"`
+	// Unavailable says why the cold tier is not in use although VMs are
+	// on it (the disk is missing, or it is no longer configured); they
+	// cannot resume until it is back.
+	Unavailable string `json:"unavailable,omitempty"`
 }
 
 // CapacityWaiter is one request queued for host capacity.
@@ -127,8 +174,15 @@ type CapacityWaiter struct {
 	// can find its own place without the queue revealing anyone's key.
 	Ticket string `json:"ticket"`
 	// MemoryBytes is the memory the request needs.
-	MemoryBytes int64     `json:"memoryBytes"`
-	Since       time.Time `json:"since"`
+	MemoryBytes int64 `json:"memoryBytes"`
+	// Resource is what its last refusal was for ("memory", "vms", "cpu",
+	// "disk"); empty before it was refused.
+	Resource string `json:"resource,omitempty"`
+	// DiskBytes is the free space it needs (its growth headroom, the
+	// headroom reserved for VMs starting and the floor) when it waits for
+	// disk space.
+	DiskBytes int64     `json:"diskBytes,omitempty"`
+	Since     time.Time `json:"since"`
 }
 
 // Profile is a named VM shape configured by the host administrator.
@@ -145,15 +199,29 @@ type NetworkCapabilities struct {
 }
 
 // Limits are administrator-configured host allocation bounds. Zero means
-// unlimited, except MinFreeDiskBytes.
+// unlimited, except the disk floor, headroom and save reserve (disk.go).
 type Limits struct {
 	CPUs        int   `json:"cpus"`
 	MemoryBytes int64 `json:"memoryBytes"`
 	DiskBytes   int64 `json:"diskBytes"`
-	// MinFreeDiskBytes is the free-space floor of the data dir: below it,
-	// new, fork and resume are refused (stop and delete never are). Zero
-	// means DefaultMinFreeDiskBytes; negative disables the floor.
-	MinFreeDiskBytes int64 `json:"minFreeDiskBytes,omitempty"`
+	// MinFreeDiskBytes and MinFreeDiskPercent make the free-space floor of
+	// the data dir: the larger of the two (DiskFloor). New, fork and resume
+	// are refused (or queued) when they would leave less free (stop and
+	// delete never are). Zero means DefaultMinFreeDiskBytes and
+	// DefaultMinFreeDiskPercent; a negative percent drops that term; a
+	// negative MinFreeDiskBytes disables the floor (and with it disk
+	// admission and the low-disk cleanup).
+	MinFreeDiskBytes   int64 `json:"minFreeDiskBytes,omitempty"`
+	MinFreeDiskPercent int   `json:"minFreeDiskPercent,omitempty"`
+	// DiskHeadroomPercent is the share of a VM's disk size admission
+	// reserves for its private growth (DiskHeadroom). Zero means
+	// DefaultDiskHeadroomPercent; negative reserves nothing.
+	DiskHeadroomPercent int `json:"diskHeadroomPercent,omitempty"`
+	// SaveReserveBytes is the space set aside (a reserve file in the data
+	// dir) that only stopping VMs may use: saving a running VM never fails
+	// for lack of space while admission keeps the floor. Zero means
+	// DefaultSaveReserveBytes; negative disables it.
+	SaveReserveBytes int64 `json:"saveReserveBytes,omitempty"`
 	// VMs bounds how many VMs may be live (provisioning to stopping) at
 	// once; zero is unlimited (G9).
 	VMs int `json:"vms,omitempty"`
@@ -194,31 +262,6 @@ func (l Limits) BootSlots() int {
 
 // DefaultMinFreeMemoryBytes is the memory floor when none is configured.
 const DefaultMinFreeMemoryBytes = 256 * MiB
-
-// DefaultMinFreeDiskBytes is the floor when none is configured.
-const DefaultMinFreeDiskBytes = GiB
-
-// FreeFloor returns the effective free-space floor (0 = disabled).
-func (l Limits) FreeFloor() int64 {
-	switch {
-	case l.MinFreeDiskBytes < 0:
-		return 0
-	case l.MinFreeDiskBytes == 0:
-		return DefaultMinFreeDiskBytes
-	}
-	return l.MinFreeDiskBytes
-}
-
-// AdmitFreeSpace refuses work that would start below the free-space floor.
-func (l Limits) AdmitFreeSpace(free int64) error {
-	floor := l.FreeFloor()
-	if floor == 0 || free >= floor {
-		return nil
-	}
-	e := Errorf(CodeResourceExhausted, "host data dir has %d bytes free, below the %d-byte floor; free space or delete VMs/snapshots", free, floor)
-	e.Retryable = true
-	return e.WithDetail("resource", "disk").WithDetail("freeBytes", free).WithDetail("floorBytes", floor)
-}
 
 // Admit checks whether adding want to used stays within l.
 func (l Limits) Admit(used, want Shape) error {

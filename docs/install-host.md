@@ -6,17 +6,12 @@ stay.
 
 ```sh
 # On the Linux host, as the user who will own the VMs (not root):
-curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc4/install.sh | sh -s -- --host
+curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc5/install.sh | sh -s -- --host
 
 # On your laptop (macOS or Linux):
-curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc4/install.sh | sh -s -- --client
+curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc5/install.sh | sh -s -- --client
 davit connect user@host
 ```
-
-> The repository is not public yet, so these URLs do not resolve yet. Until it is, build a release with
-> `make release` and install from its directory with `--from DIR` (see [Contributors](#contributors)).
-> Publishing needs: the public GitHub repository (`buildinfo.Repo`), a pushed `v*` tag to run
-> `.github/workflows/release.yml`, and a first run of that workflow to confirm the runner builds the images.
 
 ## What you need
 
@@ -25,7 +20,7 @@ davit connect user@host
 | OS | Linux x86_64 with systemd. Tested on Ubuntu 24.04; Debian 12 and other systemd distributions are expected to work but are untested | macOS (Apple silicon or Intel) or Linux, x86_64 or arm64 |
 | Virtualization | KVM: bare metal with VT-x/AMD-V on, or a cloud/VM instance with nested virtualization | none |
 | Memory | 4 GiB minimum, 8 GiB or more recommended | any |
-| Disk | 10 GiB free for the data dir (the dev image is a 491 MB download and unpacks to 1.7 GiB; VM disks grow from there). btrfs or XFS (reflink) makes forks and new boxes instant; ext4 works, copying whole disks | 30 MB |
+| Disk | 10 GiB free for the data dir (the dev image is a 491 MB download and unpacks to 1.7 GiB; VM disks grow from there). btrfs or XFS (reflink) makes forks and new boxes instant; ext4 works, copying whole disks. Optional: a second, larger local disk for stopped boxes ([storage-tiers.md](storage-tiers.md)) | 30 MB |
 | Account | a normal user that can `sudo` once for the fixes below; log in over SSH or a console (not `sudo -u`/`su`, which have no systemd user session) | SSH key access to the host (`ssh user@host true` must not prompt) |
 | Tools | `curl` (or `wget`), `tar`, `zstd`; the installer prints the `apt-get`/`dnf` line for anything missing | `curl`, `tar`, `ssh` |
 

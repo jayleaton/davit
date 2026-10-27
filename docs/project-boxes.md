@@ -35,6 +35,9 @@ davit box sync --pull coverage.out  # bring results back (paths relative to the 
 davit box down                      # optional: the instance stops itself after 15 min unused
 ```
 
+Unused boxes older than 3 days (project images with no instances: 1 day) can be auto-deleted when the host is
+low on disk; `davit box pin` keeps one ([below](#when-the-host-is-low-on-disk)).
+
 Sync adds and updates files but never deletes them: a file deleted or renamed in the worktree stays in the box
 until it is deleted there (`davit box run -- rm PATH`) or the instance is recreated (`davit box rm --yes`,
 then the next `box run`).
@@ -98,7 +101,10 @@ Outside a git work tree nothing is synced, and the setup runs in an empty work d
 | `box ssh [PROJECT[/INSTANCE]] [-- CMD...]` | Real OpenSSH into the instance: a short-lived certificate and the pinned host key, through the API tunnel. |
 | `box sync [PROJECT[/INSTANCE]] [DIR[:GUEST_PATH]] [--git index\|full\|none]` | Pushes the worktree (or DIR) to `/home/davit/work`: tracked files and untracked files that are not ignored (`git ls-files`), checked-out submodules, never `.git`. It merges, so files deleted locally stay in the box. Then it sets up git there: `index` (the default) makes the files a git index, so `git ls-files` and `git status` work; `full` also brings the current branch's history (a bundle of HEAD, with the index on it, so `git diff HEAD` is this worktree's changes); `none` does nothing. |
 | `box sync [PROJECT[/INSTANCE]] --pull GUEST_PATH [LOCAL]` | Copies a file or directory back. A relative GUEST_PATH is relative to the work dir. |
-| `box ls [PROJECT]` | A host line first (memory used and free, the memory reserved by live VMs against the budget, boxes running, how many are idle enough to stop for room, requests waiting), then images (latest generation) and instances: state, the generation each started from (marked when older than the latest), shape, age and idle time. `--json` has the host line as `host`. |
+| `box ls [PROJECT]` | A host line first (memory used and free, the memory reserved by live VMs against the budget, the data disk's free space against its floor and what is reserved, the cold storage tier if the host has one, boxes running, how many are idle enough to stop for room, requests waiting), with the boxes the host auto-deleted in the last week under it. Then images (latest generation) and instances: state, tier (`hot`, or `cold (N to restore)`), the generation each started from (marked when older than the latest), shape, age, idle time and `pinned` or `pinned hot`. `--json` has the host line as `host` (`freeDiskBytes`, `diskFloorBytes`, `diskReservedBytes`, `saveReserveBytes`, `cold`, `autoDeleted`), and on items `tier` (`hot` or `cold`), `coldBytes`, and `keep` and `keepHot` on pinned items. |
+| `box ls [PROJECT] --deleted` | The boxes the host auto-deleted for disk space in the last week, each with why (how long it was unused, the disk's state). |
+| `box pin [PROJECT[/INSTANCE] \| PROJECT/image] [--hot]` | Pins an instance, or the project image: the host never auto-deletes it. It can still move to cold storage; `--hot` also keeps it on hot storage ([below](#cold-storage)). `box unpin` undoes both; `box up --keep` pins as it brings the box up. |
+| `box image prune [--dry-run]` | Removes the host's image blobs that no image uses (host owner only; [below](#when-the-host-is-low-on-disk)). |
 | `box rm [PROJECT[/INSTANCE]] --yes` | Deletes an instance and its disk. |
 | `box gc [PROJECT] [--idle 10m] [--rm-older-than 7d] [--dry-run]` | Stops your boxes idle at least `--idle` (default 10m), oldest first, and with `--rm-older-than` deletes instances stopped at least that long (never a project image). A box with a running process, an open `box ssh` or recent activity is never stopped. `--dry-run` only lists. |
 
@@ -106,7 +112,8 @@ Outside a git work tree nothing is synced, and the setup runs in an empty work d
 
 - Out of host memory or disk (`resource_exhausted`, exit 8), after the host stopped what was idle and the
   `--wait` ran out: `box ls`, then `box down` or `box rm` idle instances (`box gc`), or ask for less with
-  `--cpus/--memory/--disk`.
+  `--cpus/--memory/--disk`. A disk refusal starts `host disk low: X free, need Y`: `box rm` what you no
+  longer need (stopping frees memory, not disk).
 - Host unreachable (exit 7): the ssh error, plus the check to run (`ssh HOST true` without a prompt) and the
   install command.
 - A failed setup: its exit code and `davit history` to read its output.
@@ -181,6 +188,69 @@ Over the API, `createVM` and `resumeVM` take `?waitSeconds=` (0 by default). Whi
 without a wait fails at once rather than overtaking (a `resumeVM` of a ready VM needs no room and answers at
 once). `capabilities.capacity` reports `waiting`,
 `reclaimable` and `memoryBudgetBytes`. `POST /vms/reclaim` is `box gc` (feature `capacityReclaim`).
+
+## When the host is low on disk
+
+Every box's disk lives on the host's data filesystem. A new box costs almost nothing there at first (its disk
+is a reflink of the image) and grows as it writes, so the host keeps a **floor** of free space: the larger of
+10% of the filesystem and 5 GiB (`limits.minFreeDiskPercent`, `limits.minFreeDiskBytes`).
+
+1. **Admission reserves room to grow.** A create or resume (and `box image build`, which creates its builder)
+   is admitted only if free space, less a quarter of its disk size (2 GiB for the default 8 GiB disk;
+   `limits.diskHeadroomPercent`) and less what is reserved for boxes still starting, stays at the floor.
+   Otherwise it queues like a box that does not fit in memory (`--wait`), and stderr says why:
+
+   ```text
+   waiting for host disk space (0 ahead): host disk low: 6.0 GiB free, need 7.0 GiB; `davit box gc` stops idle boxes, `davit box rm` deletes ones you no longer need
+   ```
+
+   When the wait runs out it fails with `resource_exhausted` (exit 8) and the same `host disk low: …`
+   message.
+2. **Saving never fails for space.** The host sets aside a save reserve (2 GiB, `limits.saveReserveBytes`)
+   that only stops use: `box down`, idle stops and `box gc` commit the disk even when running boxes have
+   filled it. Admission refuses new work long before that.
+3. **Below the floor the host cleans up**, and stops as soon as free space is back at the floor plus a margin
+   (2 GiB), cheapest loss first:
+   - davit's own garbage: disks of deleted boxes, goldens that can never be used again, and image blobs no
+     image uses (`box image prune` does this on demand);
+   - idle boxes are stopped (as when making room for memory);
+   - **unused boxes are deleted**, least recently used first: project images with no instances that have not
+     been used for a day, then stopped instances unused for 3 days. A box that is running, has a session or
+     process, is queued for, was used within that age or is **pinned** (`box pin`, `box up --keep`) is never
+     deleted, and neither is any VM that is not a box, nor the image a queued `box up` boots. A queued box
+     create or resume runs the same cleanup for the room it needs, but while the host is above the floor
+     it stops and deletes only your own boxes.
+
+   Each deletion is logged by the daemon, recorded on the box (`box ls --deleted`, the VM's `deleteReason`)
+   and in `davit events` as `vm.autodeleted`, and named under the `box ls` host line and by `davit doctor`
+   for a week. The host administrator can change the ages, the margin, or turn auto-delete off
+   ([vm-host.md](vm-host.md#disk-space-floor-reservation-and-auto-delete)).
+
+   On a host with a cold storage tier, stopped boxes move there before any is deleted
+   ([below](#cold-storage)).
+
+## Cold storage
+
+A host can have a second, larger and slower disk for stopped boxes ([storage-tiers.md](storage-tiers.md)).
+A box stopped and unused for a while (6 hours by default) moves there. Its next `box up`, `run`, `ssh` or
+`sync` copies its disk back first, so that first resume is slower; the ones after it are not. stderr says so:
+
+```text
+box myproj/main: restoring from cold storage (5.1 GiB)…
+box myproj/main: resuming (operation op_…)
+  storage.restore       …% restoring from cold storage: 2.0 GiB of 5.1 GiB (39%)
+```
+
+How long the copy takes depends on the host's cold disk and the box's size.
+
+- **`box ls`** shows each box's tier: `hot`, or `cold (5.1 GiB to restore)`.
+- **`box pin`** (and `box up --keep`) keeps a box from being auto-deleted, but it can still go cold.
+  **`box pin --hot`** also keeps it on hot storage, so it always resumes at once; on a cold box it brings it
+  back in the background. Pin hot only the boxes you resume often: pinned-hot boxes stay on the host's fast
+  disk for good.
+- If the host's disk is low, the resume reserves room for the copy too, and can wait or fail with
+  `restoring from cold storage needs N GiB: host disk low: …`
+  ([troubleshooting.md](troubleshooting.md#restoring-from-cold-storage-needs-n-gib)).
 
 ## Idle stop
 

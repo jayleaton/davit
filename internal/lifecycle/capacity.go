@@ -21,9 +21,12 @@ import (
 type usage struct {
 	live    int   // VMs holding a slot: provisioning to stopping
 	pending int64 // memory of provisioning VMs, not yet in the measurement
+	// pendingDisk is the growth headroom of provisioning VMs, which have
+	// not written to their disks yet (disk.go).
+	pendingDisk int64
 }
 
-func liveUsage(tx *state.Tx) (usage, error) {
+func liveUsage(tx *state.Tx, l domain.Limits) (usage, error) {
 	vms, err := tx.AllVMs()
 	if err != nil {
 		return usage{}, err
@@ -35,6 +38,8 @@ func liveUsage(tx *state.Tx) (usage, error) {
 		}
 		if r.VM.State == domain.StateProvisioning {
 			u.pending += r.VM.Shape.MemoryBytes
+			// A cold VM's resume copies its disk back first (coldtier.go).
+			u.pendingDisk += l.DiskHeadroom(r.VM.Shape) + coldRestore(r.VM)
 		}
 	}
 	return u, nil
@@ -58,11 +63,7 @@ func (s *Service) freeMemory() (free int64, ok bool, err error) {
 
 // admitHost refuses one more live VM of shape want beyond Limits.VMs, or
 // one whose memory would leave less than Limits.MemoryFloor() available.
-func (s *Service) admitHost(tx *state.Tx, want domain.Shape) error {
-	u, err := liveUsage(tx)
-	if err != nil {
-		return err
-	}
+func (s *Service) admitHost(u usage, want domain.Shape) error {
 	if err := s.cfg.Limits.AdmitVMs(u.live); err != nil {
 		return err
 	}
@@ -81,27 +82,33 @@ func (s *Service) capacity(ctx context.Context) *domain.HostCapacity {
 		if c.Allocated, err = tx.Allocated(); err != nil {
 			return err
 		}
-		u, err = liveUsage(tx)
+		u, err = liveUsage(tx, s.cfg.Limits)
 		return err
 	}); err != nil {
 		s.cfg.Log.Warn("capacity report", "err", err)
 		return nil
 	}
 	c.LiveVMs = u.live
-	memory, disk := int64(-1), int64(-1)
+	memory := int64(-1)
 	if free, ok, err := s.freeMemory(); err != nil {
 		s.cfg.Log.Warn("capacity report", "err", err)
 	} else if ok {
 		c.FreeMemoryBytes, memory = free, max(0, free-u.pending)
 	}
-	if s.cfg.FreeSpace != nil {
-		if free, err := s.cfg.FreeSpace(); err != nil {
-			s.cfg.Log.Warn("capacity report: measure free space", "err", err)
-		} else {
-			c.FreeDiskBytes, disk = free, free
-		}
+	var disk *domain.DiskUsage
+	if d, ok, err := s.diskUsage(); err != nil {
+		s.cfg.Log.Warn("capacity report", "err", err)
+	} else if ok {
+		disk = &d
+		c.FreeDiskBytes, c.TotalDiskBytes = d.FreeBytes, d.TotalBytes
+		c.DiskFloorBytes = s.cfg.Limits.DiskFloor(d.TotalBytes)
+		c.DiskReservedBytes = u.pendingDisk
+		c.DiskHeadroomBytes = s.cfg.Limits.DiskHeadroom(domain.DefaultShape)
 	}
-	c.Slots = s.cfg.Limits.Slots(c.Allocated, c.LiveVMs, memory, disk, domain.DefaultShape)
+	if r := s.cfg.SaveReserve; r != nil {
+		c.SaveReserveBytes, c.SaveReserveArmed = r.Size(), r.Armed()
+	}
+	c.Slots = s.cfg.Limits.Slots(c.Allocated, c.LiveVMs, memory, disk, u.pendingDisk, domain.DefaultShape)
 	c.MemoryBudgetBytes = s.cfg.Limits.MemoryBudget()
 	if s.cfg.TotalMemory != nil {
 		if total, err := s.cfg.TotalMemory(); err == nil {
@@ -110,6 +117,7 @@ func (s *Service) capacity(ctx context.Context) *domain.HostCapacity {
 			s.cfg.Log.Warn("capacity report: measure total memory", "err", err)
 		}
 	}
+	c.Cold = s.coldCapacity(ctx)
 	if after := s.cfg.Limits.ReclaimIdleAfter(); after > 0 {
 		if vms, err := s.reclaimable(ctx, reclaimQuery{idle: after, needTimeout: true}); err != nil {
 			s.cfg.Log.Warn("capacity report: reclaimable VMs", "err", err)

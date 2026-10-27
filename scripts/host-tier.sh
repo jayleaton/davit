@@ -12,7 +12,9 @@
 #   4. tier       scripts/vm-tier.sh: the real-VM tests (DAVIT_TEST_FIRECRACKER=1)
 #
 # Options:
-#   --bench, --fresh-host, --timeout DUR, --pkg PKG, --dir DIR, --fs DIR   passed to vm-tier.sh
+#   --bench, --fresh-host, --timeout DUR, --pkg PKG, --small-fs DIR, --cold-fs DIR, --dir DIR,
+#   --fs DIR
+#                      passed to vm-tier.sh
 #   --rebuild-images   build the image even when the host's matches images/
 #   --min-disk GIB     free space the preflight requires (default 20)
 #   --skip-images      no image step: the host already has blobs (vm-tier.sh --prepare --blobs)
@@ -25,14 +27,14 @@
 # failed, 130 interrupted, 255 SSH).
 set -uo pipefail
 
-usage() { sed -n '2,25p' "$0" >&2; exit 2; }
+usage() { sed -n '2,27p' "$0" >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS=$ROOT/scripts
 PASS=() LAYOUT=() SKIP_IMAGES=0 REBUILD=0 RESULTS=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--bench | --fresh-host) PASS+=("$1"); shift ;;
-	--timeout | --pkg) [ $# -ge 2 ] || usage; PASS+=("$1" "$2"); shift 2 ;;
+	--timeout | --pkg | --small-fs | --cold-fs) [ $# -ge 2 ] || usage; PASS+=("$1" "$2"); shift 2 ;;
 	--dir | --fs) [ $# -ge 2 ] || usage; LAYOUT+=("$1" "$2"); shift 2 ;;
 	--rebuild-images) REBUILD=1; shift ;;
 	--skip-images) SKIP_IMAGES=1; shift ;;

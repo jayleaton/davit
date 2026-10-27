@@ -29,13 +29,17 @@ type VMRecord struct {
 	// (VM.Environment), so preparation never depends on the environment
 	// still existing.
 	Manifest *domain.EnvManifest
+	// ColdCommits are the storage commits the VM's last move to the cold
+	// tier put there (VM.Tier); storage GC removes their hot copies.
+	ColdCommits []string
 }
 
 type vmDoc struct {
 	domain.VM
-	Env      []string            `json:"env,omitempty"`
-	Network  json.RawMessage     `json:"network,omitempty"`
-	Manifest *domain.EnvManifest `json:"workspaceManifest,omitempty"`
+	Env         []string            `json:"env,omitempty"`
+	Network     json.RawMessage     `json:"network,omitempty"`
+	Manifest    *domain.EnvManifest `json:"workspaceManifest,omitempty"`
+	ColdCommits []string            `json:"coldCommits,omitempty"`
 }
 
 func nullString(s string) any {
@@ -51,7 +55,7 @@ func (t *Tx) PutVM(rec *VMRecord) error {
 	if err := vm.CheckInvariants(); err != nil {
 		return err
 	}
-	doc, err := json.Marshal(vmDoc{VM: *vm, Env: rec.Env, Network: rec.Network, Manifest: rec.Manifest})
+	doc, err := json.Marshal(vmDoc{VM: *vm, Env: rec.Env, Network: rec.Network, Manifest: rec.Manifest, ColdCommits: rec.ColdCommits})
 	if err != nil {
 		return err
 	}
@@ -85,7 +89,7 @@ func scanVM(s interface{ Scan(...any) error }) (*VMRecord, error) {
 	if err := json.Unmarshal([]byte(doc), &d); err != nil {
 		return nil, err
 	}
-	rec := &VMRecord{VM: d.VM, Env: d.Env, DiskID: disk, RetainedDiskID: retained, Network: d.Network, Manifest: d.Manifest}
+	rec := &VMRecord{VM: d.VM, Env: d.Env, DiskID: disk, RetainedDiskID: retained, Network: d.Network, Manifest: d.Manifest, ColdCommits: d.ColdCommits}
 	if rec.VM.Egress.Mode == "" { // records from before egress modes
 		rec.VM.Egress = domain.DefaultEgress()
 	}
@@ -229,7 +233,7 @@ func (t *Tx) ListVMs(owner domain.PrincipalID, states []domain.VMState, p Page) 
 		if err := json.Unmarshal([]byte(doc), &d); err != nil {
 			return nil, "", err
 		}
-		out = append(out, &VMRecord{VM: d.VM, Env: d.Env, DiskID: disk, RetainedDiskID: retained, Network: d.Network})
+		out = append(out, &VMRecord{VM: d.VM, Env: d.Env, DiskID: disk, RetainedDiskID: retained, Network: d.Network, ColdCommits: d.ColdCommits})
 		lastNS, lastID = ns, id
 	}
 	return out, "", rows.Err()

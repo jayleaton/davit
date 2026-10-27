@@ -257,6 +257,70 @@ An evicted golden costs nothing until it is needed. Instances already restored f
 create from that image or snapshot captures it again, which takes one cold boot plus the memory write (21.7 s
 for the 2.5 GB-setup project image on the test host); the creates after that restore it.
 
+
+## Disk space: floor, reservation and auto-delete
+
+Boxes, images, snapshots and goldens share the data filesystem (`~/.svm` on the VM host, XFS with reflink).
+On 2026-10-26 it ran out while agents created, deleted and resumed 4–8 GiB boxes: guest ext4 disks went
+read-only and a stop failed writing its commit. The daemon now guards it:
+
+- **Floor.** Free space must stay above the larger of `limits.minFreeDiskBytes` (default 5 GiB) and
+  `limits.minFreeDiskPercent` of the filesystem (default 10). A negative `minFreeDiskBytes` turns disk
+  admission and the cleanup off.
+- **Growth reservation.** A box's disk is a reflink of an image or snapshot: it costs almost nothing when it
+  starts (14 MiB for a fresh box, [above](#capacity-running-vs-parked-boxes)) and grows as the guest writes.
+  The true worst case is its whole disk size, which would refuse most hosts long before they are full.
+  Admission therefore reserves `limits.diskHeadroomPercent` (default 25) of the disk size, 2 GiB for the
+  default 8 GiB disk. It admits a create, fork, resume or recover only if free space less that reservation,
+  and less the reservation of VMs still provisioning (they have not written yet), stays at the floor.
+  Otherwise the request is refused, or queued with `waitSeconds` (`box --wait`), with `resource: disk` and
+  `host disk low: X free, need Y`.
+- **Save reserve.** `<dataDir>/save-reserve` is a preallocated file of `limits.saveReserveBytes` (default
+  2 GiB; negative: none). A stop that starts with less free space than that releases it first, and a commit
+  that fails with ENOSPC releases it and retries once. The sweeper puts it back once no stop is running and
+  twice its size is free. Keep it below the floor, so that admission stops new work first. With copy storage
+  (no reflink) a commit copies the whole disk, which the reserve cannot cover.
+- **Cleanup below the floor.** Every sweep (15 s) below the floor, and the head of the capacity queue when it
+  waits for disk, frees space until it is back at the floor (or what the queued request needs) plus
+  `autoDelete.marginBytes`. For a queued request while the host is still above the floor, it stops and
+  deletes only that requester's boxes, and deletes nothing for a request that needs more than the whole
+  filesystem. A run that freed nothing waits for the journal to change (a box stopped, unpinned or deleted),
+  or a minute, before the next. It goes in this order:
+  1. Garbage davit owns and can prove unused: disks and commits the journal no longer references, goldens
+     that can never be restored, goldens above `firecracker.goldenMinFreeBytes` (never an image's newest),
+     and image blobs no manifest or served image names (`davit box image prune`, `POST /images/prune`). A
+     blob that changed within `autoDelete.blobMinAge` (default 1h) is kept, because install.sh moves blobs
+     in before their manifest.
+  2. Idle boxes are stopped (reflink storage only).
+  3. With a cold storage tier, stopped VMs unused for 10 minutes move to it, least recently used first
+     ([storage-tiers.md](storage-tiers.md#the-disk-floor-the-save-reserve-and-auto-delete)). Nothing is lost
+     but a fast first resume.
+  4. Unused boxes are deleted, least recently used first: project images with no instances unused for
+     `autoDelete.imageMinAge`, then stopped instances unused for `autoDelete.instanceMinAge`. Never one that
+     is running, has a session, process or prompt lease, is queued for (a resume of it, or a create from one
+     of its image's generations), is pinned (`keep`), or is not a box. With a cold tier, only boxes still on
+     hot storage: deleting a cold one frees nothing here.
+     A project image's generations and goldens go with it.
+
+  The defaults: 3 days for instances, which keeps a stopped box across a weekend away; 1 day for images
+  without instances, which hold nothing a `box image build` cannot make again. Each deletion is logged at
+  warn level (box, age, last use, bytes freed), set as the VM's `deleteReason`, and appended as a
+  `vm.autodeleted` event that `box ls`, `box ls --deleted` and `davit doctor` read.
+
+```json
+"limits": {"minFreeDiskBytes": 5368709120, "minFreeDiskPercent": 10, "diskHeadroomPercent": 25, "saveReserveBytes": 2147483648},
+"autoDelete": {"enabled": true, "instanceMinAge": "72h", "imageMinAge": "24h", "marginBytes": 2147483648, "blobMinAge": "1h"}
+```
+
+`capabilities.capacity` reports `freeDiskBytes`, `totalDiskBytes`, `diskFloorBytes`, `diskReservedBytes`,
+`diskHeadroomBytes`, `saveReserveBytes` and `saveReserveArmed`. `davit doctor` checks them (`disk_admission`)
+and warns below twice the floor.
+
+**Cold storage.** A second, larger and slower local disk (`coldStorage.dir`) can take the stopped boxes nobody
+used for 6 hours (`coldStorage.after`). It keeps its own floor, and its own cleanup auto-deletes the oldest
+cold boxes only when it is full. A cold box's next resume copies its disk back first. Setup, sizing and
+operations: [storage-tiers.md](storage-tiers.md).
+
 ## Running the host as a VM (Proxmox)
 
 A Proxmox VM with nested KVM works as a host. Two settings matter, and both are in the VM's config, not davit's.
@@ -288,6 +352,8 @@ the default `pve/data` pool:
   metadata. Before growing a VM disk, check that the pool would stay under 75% if the new space filled completely.
   A disk grows online with `qm resize VMID scsi1 +NG`, then `xfs_growfs` in the guest.
 - LVM's thin-pool autoextend (`thin_pool_autoextend_threshold`) is a node setting, off by default.
+- A second virtual disk on HDD storage can be the host's cold storage tier:
+  [storage-tiers.md](storage-tiers.md#proxmox).
 
 ## CI
 

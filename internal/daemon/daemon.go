@@ -87,6 +87,7 @@ func RunWith(ctx context.Context, cfg config.Daemon, log *slog.Logger, opts Opti
 	if err != nil {
 		return err
 	}
+	cold, coldErr := coldPolicy(ctx, cfg, db, store, log)
 	// Guest agent: with a guest transport, readiness runs the restore
 	// barrier and the process API is enabled. Secrets persist owner-only
 	// in the data dir so a restarted daemon can still reach running guests.
@@ -182,7 +183,10 @@ func RunWith(ctx context.Context, cfg config.Daemon, log *slog.Logger, opts Opti
 		HostOwner: httpapi.LocalPrincipal(os.Getuid()),
 		DB:        db, Runtime: rt, Storage: store, Images: images, Prober: prober, Network: netProv, OnDeleted: onDeleted,
 		Identity: identity,
-		Limits:   cfg.Limits, FreeSpace: func() (int64, error) { return preflight.FreeBytes(cfg.DataDir) }, FreeMemory: preflight.FreeMemory, DefaultTTL: time.Duration(cfg.DefaultTTL), StopGrace: time.Duration(cfg.StopGrace),
+		Limits:   cfg.Limits, DiskSpace: func() (domain.DiskUsage, error) { return preflight.DiskSpace(cfg.DataDir) },
+		SaveReserve: saveReserve(cfg), SyncDisk: func() error { return preflight.SyncFS(cfg.DataDir) },
+		AutoDelete: autoDeletePolicy(cfg.AutoDelete), ImageBlobs: imageBlobs(cfg), Cold: cold, ColdUnavailable: coldErr,
+		FreeMemory: preflight.FreeMemory, DefaultTTL: time.Duration(cfg.DefaultTTL), StopGrace: time.Duration(cfg.StopGrace),
 		StopAttempts: cfg.StopAttempts, NoStopForce: cfg.StopForceAfterRetries != nil && !*cfg.StopForceAfterRetries,
 		TTLWarning: time.Duration(cfg.TTLWarning), Profiles: cfg.Profiles,
 		Listeners: listenerNames(cfg), Services: serviceNames(guest),
@@ -615,6 +619,106 @@ func (d agentDialer) DialGuest(ctx context.Context, t gateway.Target, port uint1
 	}
 	dial := func(ctx context.Context) (net.Conn, error) { return tgt.Dialer.DialGuest(ctx, guestclient.DefaultPort) }
 	return guestclient.DialTCP(ctx, dial, guestclient.Session{VMID: string(tgt.Key.VMID), Generation: uint64(tgt.Key.Generation), Secrets: s}, port)
+}
+
+// saveReserve is the space set aside for stops: <dataDir>/save-reserve
+// (nil when limits.saveReserveBytes disables it).
+func saveReserve(cfg config.Daemon) lifecycle.SaveReserve {
+	n := cfg.Limits.SaveReserve()
+	if n == 0 {
+		return nil
+	}
+	return &lifecycle.FileReserve{Path: filepath.Join(cfg.DataDir, "save-reserve"), Bytes: n}
+}
+
+// coldPolicy attaches the configured cold storage tier to store (nil
+// without one). A tier that cannot be attached (its disk is not mounted)
+// does not stop the daemon: everything hot works, and the reason is
+// returned for the VMs on cold storage, which cannot resume until it is
+// back (docs/storage-tiers.md#when-the-cold-disk-is-missing).
+func coldPolicy(ctx context.Context, cfg config.Daemon, db *state.DB, store *storage.FS, log *slog.Logger) (*lifecycle.ColdPolicy, string) {
+	c := cfg.ColdStorage
+	root := filepath.Join(cfg.DataDir, "storage")
+	if c.Dir == "" {
+		was, ok := storage.ColdRecorded(root)
+		if !ok {
+			return nil, ""
+		}
+		n, err := lifecycle.ColdVMs(ctx, db)
+		if err == nil && n == 0 {
+			if err := storage.ForgetCold(root); err != nil {
+				log.Warn("forget the removed cold storage tier", "err", err)
+			}
+			return nil, ""
+		}
+		why := fmt.Sprintf("coldStorage.dir is not configured, but %d VMs are on the cold tier at %s", n, was)
+		log.Error("cold storage unavailable", "reason", why)
+		return nil, why
+	}
+	if err := store.AttachCold(c.Dir); err != nil {
+		log.Error("cold storage unavailable: VMs on it cannot resume until it is back", "dir", c.Dir, "err", err)
+		return nil, err.Error()
+	}
+	same := preflight.SameFilesystem(cfg.DataDir, c.Dir)
+	p, _ := store.ColdProbe()
+	if same {
+		log.Warn("coldStorage.dir is on the data dir's filesystem: moving VMs there frees nothing", "dir", c.Dir)
+	}
+	pol := &lifecycle.ColdPolicy{
+		After: time.Duration(c.After), BytesPerSecond: c.BytesPerSecond, MinBytes: c.MinBytes,
+		DiskSpace:      func() (domain.DiskUsage, error) { return preflight.DiskSpace(c.Dir) },
+		SyncDisk:       func() error { return preflight.SyncFS(c.Dir) },
+		SameFilesystem: same, HostBusy: ioBusy(c.IOBusyPercent),
+		MinFreeBytes: c.MinFreeBytes, MinFreePercent: c.MinFreePercent, Drain: c.Drain,
+	}
+	log.Info("cold storage tier", "dir", c.Dir, "probe", p.Detail, "after", pol.AfterOrDefault().String(), "drain", c.Drain)
+	return pol, ""
+}
+
+// ioBusy reports the host busy above pct percent I/O pressure (0: the
+// default; negative: never).
+func ioBusy(pct int) func() bool {
+	if pct < 0 {
+		return nil
+	}
+	if pct == 0 {
+		pct = preflight.DefaultIOBusyPercent
+	}
+	return func() bool {
+		v, ok := preflight.IOPressure()
+		return ok && v > float64(pct)
+	}
+}
+
+func autoDeletePolicy(a config.AutoDelete) lifecycle.AutoDeletePolicy {
+	return lifecycle.AutoDeletePolicy{
+		Disabled:       a.Enabled != nil && !*a.Enabled,
+		InstanceMinAge: time.Duration(a.InstanceMinAge), ImageMinAge: time.Duration(a.ImageMinAge),
+		MarginBytes: a.MarginBytes,
+	}
+}
+
+// imageBlobs is the daemon's own blob store, <dataDir>/images/blobs. Its
+// blobs stay while any manifest in <dataDir>/images/manifests, any retired
+// manifest (lifecycle.RetiredDir: older boxes still boot its kernel) or any
+// configured manifest names them (configured images may share it).
+func imageBlobs(cfg config.Daemon) *lifecycle.BlobStore {
+	dir := filepath.Join(cfg.DataDir, "images")
+	return &lifecycle.BlobStore{Dir: filepath.Join(dir, "blobs"), Manifests: func() ([]string, error) {
+		found, err := filepath.Glob(filepath.Join(dir, "manifests", "*.json"))
+		if err != nil {
+			return nil, err
+		}
+		retired, err := filepath.Glob(filepath.Join(lifecycle.RetiredDir(dir), "*.json"))
+		if err != nil {
+			return nil, err
+		}
+		found = append(found, retired...)
+		for _, i := range cfg.Images {
+			found = append(found, i.Manifest)
+		}
+		return found, nil
+	}, MinAge: time.Duration(cfg.AutoDelete.BlobMinAge)}
 }
 
 func newCatalog(ctx context.Context, cfg config.Daemon) (lifecycle.ImageCatalog, error) {

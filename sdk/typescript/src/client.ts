@@ -75,6 +75,8 @@ import type {
   PromptFeedItem,
   PromptRequest,
   PushResult,
+  PruneImagesRequest,
+  PruneImagesResult,
   PutCredentialRequest,
   ReclaimVMsRequest,
   ReclaimVMsResult,
@@ -155,6 +157,7 @@ export const OPERATIONS = Object.freeze({
   createVM: ["POST", "/vms"],
   createVMs: ["POST", "/vms/batch"],
   reclaimVMs: ["POST", "/vms/reclaim"],
+  pruneImages: ["POST", "/images/prune"],
   getVM: ["GET", "/vms/{vmId}"],
   deleteVM: ["DELETE", "/vms/{vmId}"],
   updateVM: ["PATCH", "/vms/{vmId}"],
@@ -1277,6 +1280,8 @@ export class DavitClient {
    * the current TTL; `egress` is live on a running VM (see `setVMEgress`).
    * `privacy` replaces the whole policy (flags left out are off): read the VM
    * and change one flag to keep the others (feature `privacyPolicy`).
+   * `keep` pins the VM against the low-disk auto-delete; `keepHot` keeps it
+   * off the host's cold storage tier.
    * Naturally idempotent: sends no Idempotency-Key. Supports `ifMatch`.
    */
   updateVM(vm: string, req: UpdateVMRequest, opts: UpdateVMOptions = {}): Promise<VM> {
@@ -1286,6 +1291,8 @@ export class DavitClient {
     if (req.autoStop !== undefined) body.autoStop = req.autoStop;
     if (req.egress !== undefined) body.egress = egressBody(req.egress);
     if (req.privacy !== undefined) body.privacy = { ...req.privacy };
+    if (req.keep !== undefined) body.keep = req.keep;
+    if (req.keepHot !== undefined) body.keepHot = req.keepHot;
     const headers: Record<string, string> = {};
     if (opts.ifMatch !== undefined) headers["If-Match"] = String(opts.ifMatch);
     return this.#call("updateVM", { params: { vmId: vm }, body, headers, opts });
@@ -1387,6 +1394,18 @@ export class DavitClient {
     if (opts.labels !== undefined) body.labels = { ...opts.labels };
     if (opts.dryRun) body.dryRun = true;
     return this.#call("reclaimVMs", { body, opts });
+  }
+
+  /**
+   * Removes the host's image blobs that no image uses (`davit box image
+   * prune`; host owner only): no manifest names their digest, no served image
+   * uses them, and they have not changed for an hour. `dryRun` only lists
+   * them.
+   */
+  pruneImages(opts: { dryRun?: boolean } & RequestOptions = {}): Promise<PruneImagesResult> {
+    const body: PruneImagesRequest = {};
+    if (opts.dryRun) body.dryRun = true;
+    return this.#call("pruneImages", { body, opts });
   }
 
   /** Deletes a VM. Waits and returns the deleted tombstone, unless `wait: false`. */

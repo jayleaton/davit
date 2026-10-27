@@ -373,7 +373,7 @@ func (s *Service) runBoot(ctx context.Context, op *domain.Operation) (*domain.Op
 		if err := s.cfg.DB.Tx(ctx, func(tx *state.Tx) (err error) { snap, err = tx.GetSnapshot(src); return err }); err != nil {
 			return nil, err
 		}
-		_, err = s.cfg.Storage.CloneCommitted(ctx, storage.CommitID(snap.CommitID), disk, rec.VM.Shape.DiskBytes)
+		err = s.cloneSnapshot(ctx, op, rec, snap, disk) // coldtier.go: a cold commit is restored
 	} else if img.Rootfs == "" {
 		err = domain.Errorf(domain.CodeNotFound, "image %s was replaced by an upgrade and its root filesystem is gone; create from the current image", img.ID)
 	} else {
@@ -470,6 +470,9 @@ func (s *Service) runStop(ctx context.Context, op *domain.Operation) (*domain.Op
 	if err := s.step(ctx, op, "guest.shutdown", 0.1); err != nil {
 		return nil, err
 	}
+	// The guest's final flush and the commit may need the save reserve
+	// (diskreserve.go).
+	defer s.beginSave(rec.VM.ID)()
 	forced := op.Params.Force
 	if h != nil {
 		// Not while a live fork holds this VM paused for its checkpoint.
@@ -508,6 +511,12 @@ func (s *Service) runStop(ctx context.Context, op *domain.Operation) (*domain.Op
 	}
 	commitID := stopCommitID(op.ID)
 	c, err := s.cfg.Storage.Commit(ctx, storage.DiskID(rec.DiskID), commitID)
+	if isNoSpace(err) {
+		// Free the save reserve if it is still held (a concurrent stop may
+		// have released it already) and try once more.
+		s.releaseSaveReserve(rec.VM.ID, -1, "commit ran out of space")
+		c, err = s.cfg.Storage.Commit(ctx, storage.DiskID(rec.DiskID), commitID)
+	}
 	if err != nil {
 		// Keep the working disk for recovery; the last good snapshot stays.
 		s.updateVM(ctx, rec.VM.ID, func(r *state.VMRecord, _ time.Time) error { r.RetainedDiskID = r.DiskID; return nil })

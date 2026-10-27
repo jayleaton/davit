@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	goruntime "runtime"
+
+	"davit/internal/domain"
 )
 
 func platformChecks(context.Context, Options) []Check {
@@ -14,6 +16,12 @@ func platformChecks(context.Context, Options) []Check {
 }
 
 func FreeBytes(string) (int64, error) { return 0, errUnsupported }
+
+func DiskSpace(string) (domain.DiskUsage, error) { return domain.DiskUsage{}, errUnsupported }
+
+func SyncFS(string) error { return errUnsupported }
+
+func SameFilesystem(string, string) bool { return false }
 
 var errUnsupported = errors.New("not supported on this OS")
 

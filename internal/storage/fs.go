@@ -50,6 +50,14 @@ type FS struct {
 
 	mu     sync.Mutex
 	leases map[string]DiskID // lease ID -> disk
+	// cold is the cold tier's root ("" without one, tier.go) and
+	// coldProbe its filesystem's clone probe.
+	cold      string
+	coldProbe ProbeResult
+	// work are the tmp/ directories of moves in flight and moving the
+	// commits they move (tier.go); Collect leaves both alone.
+	work   map[string]bool
+	moving map[CommitID]int
 }
 
 var _ Store = (*FS)(nil)
@@ -63,6 +71,9 @@ type manifest struct {
 	CreatedAt time.Time `json:"createdAt"`
 	Mode      Mode      `json:"mode"`
 	Data      string    `json:"data"`
+	// DataDigest is set on a cold copy (tier.go): the digest of its data,
+	// checked when it is copied and again when it is restored.
+	DataDigest string `json:"dataDigest,omitempty"`
 }
 
 // Open opens (creating if needed) a store rooted at root. mode "" probes the
@@ -90,7 +101,7 @@ func openWith(root string, mode Mode, cs cloneStrategy) (*FS, error) {
 			return nil, fmt.Errorf("storage root: %w", err)
 		}
 	}
-	f := &FS{root: abs, clone: cs, leases: map[string]DiskID{}}
+	f := &FS{root: abs, clone: cs, leases: map[string]DiskID{}, work: map[string]bool{}, moving: map[CommitID]int{}}
 
 	if mode == ModeCopy {
 		f.probe = ProbeResult{Mode: ModeCopy, FastClone: false, Detail: "copy mode forced by configuration; clones are full copies"}
@@ -175,15 +186,17 @@ func (f *FS) CloneCommitted(ctx context.Context, from CommitID, id DiskID, sizeB
 	if sizeBytes < 0 {
 		return Disk{}, domain.Errorf(domain.CodeInvalidArgument, "invalid disk size %d", sizeBytes)
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if d, ok, err := f.existingDisk(id); ok || err != nil {
-		return d, err
-	}
-	if _, _, err := f.readCommit(from); err != nil {
+	// A cold commit is copied back outside the lock (Restore).
+	return f.Restore(ctx, from, id, sizeBytes, RestoreOptions{})
+}
+
+// cloneLocked is CloneCommitted of a hot commit. Caller holds f.mu.
+func (f *FS) cloneLocked(ctx context.Context, from CommitID, id DiskID, sizeBytes int64) (Disk, error) {
+	c, _, err := f.readCommit(from)
+	if err != nil {
 		return Disk{}, err
 	}
-	src, err := os.Open(filepath.Join(f.commitDir(from), commitData))
+	src, err := os.Open(c.Path)
 	if err != nil {
 		return Disk{}, fmt.Errorf("open commit: %w", err)
 	}
@@ -399,11 +412,22 @@ func (f *FS) OpenCommit(ctx context.Context, id CommitID) (*CommitFile, error) {
 	return &CommitFile{File: file, Commit: c}, nil
 }
 
-// readCommit loads a published commit. A missing or invalid manifest, or data
-// whose size disagrees with it, means not published (not_found).
+// readCommit loads a published commit, hot or else cold. Caller holds f.mu.
 func (f *FS) readCommit(id CommitID) (Commit, manifest, error) {
+	c, m, err := f.readCommitIn(f.root, id)
+	if err != nil && f.cold != "" && domain.IsCode(err, domain.CodeNotFound) {
+		if cc, cm, cerr := f.readCommitIn(f.cold, id); cerr == nil {
+			return cc, cm, nil
+		}
+	}
+	return c, m, err
+}
+
+// readCommitAt loads the published commit id in dir. A missing or invalid
+// manifest, or data whose size disagrees with it, means not published
+// (not_found).
+func readCommitAt(dir string, id CommitID) (Commit, manifest, error) {
 	notFound := domain.Errorf(domain.CodeNotFound, "commit %q not found", id)
-	dir := f.commitDir(id)
 	mb, err := os.ReadFile(filepath.Join(dir, manifestName))
 	if errors.Is(err, os.ErrNotExist) {
 		return Commit{}, manifest{}, notFound
@@ -420,7 +444,7 @@ func (f *FS) readCommit(id CommitID) (Commit, manifest, error) {
 		return Commit{}, manifest{}, notFound
 	}
 	sum := sha256.Sum256(mb)
-	return Commit{ID: id, Path: path, SizeBytes: m.SizeBytes, Digest: "sha256:" + hex.EncodeToString(sum[:]), CreatedAt: m.CreatedAt}, m, nil
+	return Commit{ID: id, Path: path, SizeBytes: m.SizeBytes, Digest: "sha256:" + hex.EncodeToString(sum[:]), CreatedAt: m.CreatedAt, Tier: domain.TierHot}, m, nil
 }
 
 // OpenForRuntime implements Store.
@@ -472,7 +496,11 @@ func (f *FS) Collect(ctx context.Context, keep KeepSet) (Collected, error) {
 		return out, err
 	}
 	for _, e := range tmpEntries {
-		if err := os.RemoveAll(filepath.Join(f.root, tmpDir, e.Name())); err != nil {
+		p := filepath.Join(f.root, tmpDir, e.Name())
+		if f.work[p] {
+			continue // a restore in flight (tier.go)
+		}
+		if err := os.RemoveAll(p); err != nil {
 			return out, err
 		}
 		out.Partial++
@@ -507,10 +535,10 @@ func (f *FS) Collect(ctx context.Context, keep KeepSet) (Collected, error) {
 	}
 	for _, e := range commitEntries {
 		id := CommitID(e.Name())
-		if validID("commit", string(id)) != nil {
+		if validID("commit", string(id)) != nil || f.moving[id] > 0 {
 			continue
 		}
-		_, _, rerr := f.readCommit(id)
+		_, _, rerr := f.readCommitIn(f.root, id)
 		published := rerr == nil
 		if published && slices.Contains(keep.Commits, id) {
 			continue
@@ -526,6 +554,9 @@ func (f *FS) Collect(ctx context.Context, keep KeepSet) (Collected, error) {
 	}
 	if err := syncDir(filepath.Join(f.root, disksDir)); err != nil {
 		return out, err
+	}
+	if f.cold != "" {
+		return out, f.collectCold(keep, &out)
 	}
 	return out, syncDir(filepath.Join(f.root, commitsDir))
 }

@@ -16,7 +16,7 @@ AppArmor setting). The installer prints exactly what to run and runs it only if 
 1. **On the host** (a Linux x86_64 box with KVM):
 
    ```sh
-   curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc4/install.sh | sh -s -- --host
+   curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc5/install.sh | sh -s -- --host
    ```
 
    Davit has release candidates only so far, so the commands name the current one (`releases/latest` starts
@@ -26,7 +26,7 @@ AppArmor setting). The installer prints exactly what to run and runs it only if 
 2. **On your laptop** (macOS or Linux):
 
    ```sh
-   curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc4/install.sh | sh -s -- --client
+   curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc5/install.sh | sh -s -- --client
    davit connect you@your-host
    ```
 
@@ -88,6 +88,7 @@ URLs and open a VM's desktop in a browser. Setup: [docs/network.md](docs/network
 - [Troubleshooting](docs/troubleshooting.md): first-run errors and their fixes.
 - [Project boxes](docs/project-boxes.md): every box command, the setup detection, host capacity.
 - [VMs and agents](docs/vms-and-agents.md): plain VMs, forks, snapshots, coding agents inside VMs, sharing, the desktop.
+- [Storage tiers](docs/storage-tiers.md): a second, larger disk for stopped boxes (cold storage), sizing, setup.
 - [Networking](docs/network.md): the tailnet gateway, egress policy, credentials.
 - [Benchmarks](docs/benchmarks.md): measured numbers, with hardware and sample counts.
 - [Status](docs/status.md): what works, what is verified on real hardware, and what is not yet.

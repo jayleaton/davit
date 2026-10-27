@@ -18,8 +18,9 @@ import (
 // Host capacity for boxes (docs/project-boxes.md#when-the-host-is-full).
 // The host stops idle boxes to make room on its own; a box create or
 // resume also waits in the host's FIFO queue for up to --wait (default
-// DefaultBoxWait), and says so on stderr. `box ls` shows the host's memory
-// and reservation; `box gc` stops idle boxes or removes old stopped ones.
+// DefaultBoxWait), for memory or for disk space, and says so on stderr.
+// `box ls` shows the host's memory, disk and reservations; `box gc` stops
+// idle boxes or removes old stopped ones.
 
 // DefaultBoxWait is how long a box create/resume queues for host capacity.
 const DefaultBoxWait = 3 * time.Minute
@@ -83,6 +84,9 @@ func queueLine(c *api.HostCapacity, ticket string) string {
 	if i < 0 {
 		return ""
 	}
+	if c.Waiting[i].Resource == "disk" {
+		return diskWaitLine(c, c.Waiting[i], i)
+	}
 	return fmt.Sprintf("waiting for host capacity (%d ahead, %s needed, %s free)", i, humanBytes(c.Waiting[i].MemoryBytes), humanBytes(c.FreeMemoryBytes))
 }
 
@@ -97,11 +101,24 @@ type boxHost struct {
 	RunningBoxes        int   `json:"runningBoxes"` // of the boxes listed
 	Reclaimable         int   `json:"reclaimable"`
 	Waiting             int   `json:"waiting"`
+	// The data disk (box_disk.go): free space, the floor admission keeps,
+	// growth headroom reserved for boxes starting and the save reserve.
+	FreeDiskBytes     int64 `json:"freeDiskBytes"`
+	TotalDiskBytes    int64 `json:"totalDiskBytes,omitempty"`
+	DiskFloorBytes    int64 `json:"diskFloorBytes,omitempty"`
+	DiskReservedBytes int64 `json:"diskReservedBytes"`
+	SaveReserveBytes  int64 `json:"saveReserveBytes,omitempty"`
+	SaveReserveArmed  bool  `json:"saveReserveArmed,omitempty"`
+	// Cold is the cold storage tier, when the host has one.
+	Cold *api.ColdCapacity `json:"cold,omitempty"`
+	// AutoDeleted are the caller's boxes the host deleted for disk space
+	// in the last week, newest first.
+	AutoDeleted []api.AutoDeletion `json:"autoDeleted"`
 }
 
 // hostSummary reads the capacity report for `box ls` (nil when the host
 // does not report capacity).
-func (s *session) hostSummary(ctx context.Context, rows []boxRow) (*boxHost, error) {
+func (s *session) hostSummary(ctx context.Context, project string, rows []boxRow) (*boxHost, error) {
 	var caps api.HostCapabilities
 	if err := s.cl.get(ctx, "/capabilities", nil, &caps); err != nil {
 		return nil, err
@@ -111,7 +128,13 @@ func (s *session) hostSummary(ctx context.Context, rows []boxRow) (*boxHost, err
 		return nil, nil
 	}
 	h := &boxHost{TotalMemoryBytes: c.TotalMemoryBytes, FreeMemoryBytes: c.FreeMemoryBytes, ReservedMemoryBytes: c.Allocated.MemoryBytes,
-		MemoryBudgetBytes: c.MemoryBudgetBytes, LiveVMs: c.LiveVMs, Reclaimable: c.Reclaimable, Waiting: len(c.Waiting)}
+		MemoryBudgetBytes: c.MemoryBudgetBytes, LiveVMs: c.LiveVMs, Reclaimable: c.Reclaimable, Waiting: len(c.Waiting),
+		FreeDiskBytes: c.FreeDiskBytes, TotalDiskBytes: c.TotalDiskBytes, DiskFloorBytes: c.DiskFloorBytes,
+		DiskReservedBytes: c.DiskReservedBytes, SaveReserveBytes: c.SaveReserveBytes, SaveReserveArmed: c.SaveReserveArmed, Cold: c.Cold}
+	h.AutoDeleted = s.autoDeleted(ctx, s.cl, project)
+	if h.AutoDeleted == nil {
+		h.AutoDeleted = []api.AutoDeletion{}
+	}
 	if c.TotalMemoryBytes > 0 {
 		h.UsedMemoryBytes = max(0, c.TotalMemoryBytes-c.FreeMemoryBytes)
 	}
@@ -135,6 +158,9 @@ func (h *boxHost) line() string {
 	fmt.Fprintf(&b, "; reserved %s", humanBytes(h.ReservedMemoryBytes))
 	if h.MemoryBudgetBytes > 0 {
 		fmt.Fprintf(&b, " of %s", humanBytes(h.MemoryBudgetBytes))
+	}
+	if d := h.diskLine(); d != "" {
+		fmt.Fprintf(&b, "; %s", d)
 	}
 	fmt.Fprintf(&b, "; %d boxes running (%d VMs live)", h.RunningBoxes, h.LiveVMs)
 	if h.Reclaimable > 0 {

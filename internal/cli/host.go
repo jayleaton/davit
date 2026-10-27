@@ -39,7 +39,7 @@ func runDoctor(ctx context.Context, s *session, o *opts, args []string) error {
 	}
 	checks := []preflight.Check{configCheck(cfg, path), runtimeCheck(cfg)}
 	checks = append(checks, preflight.Run(ctx, preflight.FromConfig(cfg)).Checks...)
-	checks = append(checks, s.daemonCheck(ctx, cfg))
+	checks = append(checks, s.daemonChecks(ctx, cfg)...)
 	if goruntime.GOOS == "linux" {
 		checks = append(checks, serviceCheck(ctx, defaultServiceProbes()))
 	}
@@ -262,14 +262,30 @@ func configCheck(cfg config.Daemon, path string) preflight.Check {
 }
 
 // daemonCheck asks the daemon serving this config (or --api-url) what it runs.
-func (s *session) daemonCheck(ctx context.Context, cfg config.Daemon) preflight.Check {
+// daemonChecks are the daemon check and, when it answers, its disk
+// admission (box_disk.go).
+func (s *session) daemonChecks(ctx context.Context, cfg config.Daemon) []preflight.Check {
+	c, cl, caps := s.daemonCheck(ctx, cfg)
+	out := []preflight.Check{c}
+	if caps != nil {
+		if d, ok := s.diskCheck(ctx, cl, *caps); ok {
+			out = append(out, d)
+		}
+		if d, ok := coldCheck(*caps); ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func (s *session) daemonCheck(ctx context.Context, cfg config.Daemon) (preflight.Check, *client, *api.HostCapabilities) {
 	c := preflight.Check{ID: "daemon", Title: "Daemon"}
 	cl := s.cl
 	if !s.g.apiURLSet {
 		var err error
 		if cl, err = newClient("unix://"+cfg.Socket, s.out.requestID); err != nil {
 			c.Status, c.Detail, c.Hint = preflight.Warn, err.Error(), `check "socket" in the config`
-			return c
+			return c, nil, nil
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -278,14 +294,14 @@ func (s *session) daemonCheck(ctx context.Context, cfg config.Daemon) preflight.
 	if err := cl.get(ctx, "/capabilities", nil, &caps); err != nil {
 		c.Status, c.Detail = preflight.Warn, "not reachable: "+err.Error()
 		c.Hint = buildinfo.Name + " daemon   (or: systemctl --user start " + buildinfo.Name + ")"
-		return c
+		return c, nil, nil
 	}
 	c.Status = preflight.Pass
 	c.Detail = "running " + caps.Version + ", runtime " + caps.Runtime.Engine + ", storage " + caps.Storage.Mode
 	if caps.Runtime.Engine != cfg.Runtime {
 		c.Status, c.Hint = preflight.Warn, "restart the daemon to apply the configured runtime "+cfg.Runtime
 	}
-	return c
+	return c, cl, &caps
 }
 
 // runInit onboards this host; see internal/onboarding.

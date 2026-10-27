@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -95,6 +96,15 @@ var versionRe = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
 // latest release's tag; a variable so tests stay offline.
 var latestReleaseURL = "https://github.com/" + buildinfo.Repo + "/releases/latest"
 
+// releasesAPIURL lists the published releases newest first, prereleases
+// included: the answer while a repository has only prereleases, which the
+// latest-release page skips.
+var releasesAPIURL = "https://api.github.com/repos/" + buildinfo.Repo + "/releases?per_page=1"
+
+// errNoLatestRelease: the latest-release page names no tag (nothing but
+// prereleases, or nothing published).
+var errNoLatestRelease = errors.New("no release published yet")
+
 // VersionCheck is the result of `davit version --check`.
 type VersionCheck struct {
 	Current string `json:"current"`
@@ -122,6 +132,10 @@ func versionCheck(ctx context.Context, out *printer, configPath string) int {
 	if src == "" {
 		vc.Source = latestReleaseURL
 		latest, err = latestGitHubTag(ctx, vc.Source)
+		if errors.Is(err, errNoLatestRelease) {
+			vc.Source = releasesAPIURL
+			latest, err = newestGitHubRelease(ctx, vc.Source)
+		}
 	} else {
 		vc.Source = strings.TrimRight(src, "/") + "/release.json"
 		latest, err = releaseDirVersion(ctx, vc.Source)
@@ -163,9 +177,42 @@ func latestGitHubTag(ctx context.Context, src string) (string, error) {
 	resp.Body.Close()
 	_, tag, ok := strings.Cut(resp.Header.Get("Location"), "/releases/tag/")
 	if !ok || !versionRe.MatchString(tag) {
-		return "", fmt.Errorf("%s: HTTP %d, no release published yet", src, resp.StatusCode)
+		return "", fmt.Errorf("%s: HTTP %d, %w", src, resp.StatusCode, errNoLatestRelease)
 	}
 	return tag, nil
+}
+
+// newestGitHubRelease reads the newest published release, a prerelease
+// included, from GitHub's releases API.
+func newestGitHubRelease(ctx context.Context, src string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, versionCheckTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("releases unreachable (offline?): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s: HTTP %d", src, resp.StatusCode)
+	}
+	var rels []struct {
+		TagName string `json:"tag_name"`
+		Draft   bool   `json:"draft"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rels); err != nil {
+		return "", fmt.Errorf("%s: %v", src, err)
+	}
+	for _, r := range rels {
+		if !r.Draft && versionRe.MatchString(r.TagName) {
+			return r.TagName, nil
+		}
+	}
+	return "", fmt.Errorf("%s: %w", src, errNoLatestRelease)
 }
 
 // releaseDirVersion reads the version of a release directory (`make release`

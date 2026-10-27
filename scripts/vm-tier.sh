@@ -26,6 +26,12 @@
 #   --rebuild-images   --images rebuilds even when the host's image matches images/
 #   --image NAME       --images builds NAME (repeatable; default ubuntu-24.04-base)
 #   --min-disk GIB     free space the host check requires on the reflink filesystem (default 20)
+#   --small-fs DIR     a small, dedicated reflink filesystem on the host that the disk-low test
+#                      (TestFirecrackerDiskLow) fills; without it that test skips. Make it yourself
+#                      (docs/vm-tier.md#a-small-filesystem-for-the-disk-low-test)
+#   --cold-fs DIR      a second dedicated reflink filesystem on the host, the cold storage tier of
+#                      the cold-tier test (TestFirecrackerColdTier; its hot data dir is --small-fs);
+#                      without both that test skips (docs/vm-tier.md#a-cold-filesystem-for-the-cold-tier-test)
 #   --out DIR          local results dir (default .build/vm-tier/<run>)
 #
 # --images ships the committed HEAD only (the baked agent must match a commit)
@@ -44,9 +50,9 @@
 # build failed (--images), 255 SSH.
 set -euo pipefail
 
-MODE=run BENCH=0 FRESH=0 TIMEOUT=90m DIR="" FS="" PKGS=() REBUILD=0 OUT="" IMAGES=() MIN_DISK=""
+MODE=run BENCH=0 FRESH=0 TIMEOUT=90m DIR="" FS="" SMALL_FS="" COLD_FS="" PKGS=() REBUILD=0 OUT="" IMAGES=() MIN_DISK=""
 BLOBS=${DAVIT_VM_BLOBS:-}
-usage() { sed -n '2,44p' "$0" >&2; exit 2; }
+usage() { sed -n '2,50p' "$0" >&2; exit 2; }
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--prepare) MODE=prepare; shift ;;
@@ -60,6 +66,8 @@ while [ $# -gt 0 ]; do
 	--fresh-host) FRESH=1; shift ;;
 	--timeout) TIMEOUT=$2; shift 2 ;;
 	--pkg) PKGS+=("$2"); shift 2 ;;
+	--small-fs) SMALL_FS=$2; shift 2 ;;
+	--cold-fs) COLD_FS=$2; shift 2 ;;
 	--dir) DIR=$2; shift 2 ;;
 	--fs) FS=$2; shift 2 ;;
 	--blobs) BLOBS=$2; shift 2 ;;
@@ -228,6 +236,6 @@ prepare)
 	;;
 run)
 	say "running the real-VM tier on $HOST: -run '$RE' ${PKGS[*]}$([ "$BENCH" = 1 ] && echo ' (bench)')"
-	rsh_long "$REMOTE run $RUN $(printf '%q' "$RE") $BENCH $TIMEOUT $FRESH $(printf '%q ' "${PKGS[@]}")"
+	rsh_long "$REMOTE run $RUN $(printf '%q' "$RE") $BENCH $TIMEOUT $FRESH $(printf '%q' "${SMALL_FS:--}") $(printf '%q' "${COLD_FS:--}") $(printf '%q ' "${PKGS[@]}")"
 	;;
 esac

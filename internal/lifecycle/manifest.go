@@ -74,6 +74,16 @@ func (c *ManifestCatalog) LoadRetired(ctx context.Context, cacheDir string, srcs
 	return cache.save()
 }
 
+// RetiredImages lists the retired images loaded (blobprune.go keeps their
+// blobs).
+func (c *ManifestCatalog) RetiredImages() []domain.Image {
+	out := make([]domain.Image, 0, len(c.retired))
+	for _, img := range c.retired {
+		out = append(out, img)
+	}
+	return out
+}
+
 // RetiredDir is where an upgrade keeps the manifests it replaced, by ID
 // (<RetiredDir>/<hex>.json), next to the data dir's manifests and blobs.
 func RetiredDir(imagesDir string) string { return filepath.Join(imagesDir, "retired") }

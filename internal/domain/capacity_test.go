@@ -67,10 +67,16 @@ func TestSlots(t *testing.T) {
 		{"memory floor", Limits{MinFreeMemoryBytes: GiB}, Shape{}, 0, 8 * GiB, -1, 3},
 		{"memory below floor", Limits{MinFreeMemoryBytes: GiB}, Shape{}, 0, GiB / 2, -1, 0},
 		{"disk floor", Limits{MinFreeDiskBytes: 2 * GiB}, Shape{}, 0, -1, GiB, 0},
-		{"disk above floor", Limits{MinFreeDiskBytes: 2 * GiB, MinFreeMemoryBytes: -1}, Shape{}, 0, -1, 3 * GiB, MaxSlots},
+		// (10-2) GiB free above the floor / 2 GiB headroom (25% of 8 GiB) = 4.
+		{"disk headroom", Limits{MinFreeDiskBytes: 2 * GiB, MinFreeMemoryBytes: -1}, Shape{}, 0, -1, 10 * GiB, 4},
+		{"disk above floor, no headroom", Limits{MinFreeDiskBytes: 2 * GiB, DiskHeadroomPercent: -1, MinFreeMemoryBytes: -1}, Shape{}, 0, -1, 3 * GiB, MaxSlots},
 		{"min of all", Limits{VMs: 10, CPUs: 64, MinFreeMemoryBytes: GiB}, Shape{}, 0, 5 * GiB, -1, 2},
 	} {
-		if got := c.l.Slots(c.used, c.live, c.mem, c.disk, sh); got != c.want {
+		var disk *DiskUsage
+		if c.disk >= 0 {
+			disk = &DiskUsage{FreeBytes: c.disk}
+		}
+		if got := c.l.Slots(c.used, c.live, c.mem, disk, 0, sh); got != c.want {
 			t.Errorf("%s: %d slots, want %d", c.name, got, c.want)
 		}
 	}

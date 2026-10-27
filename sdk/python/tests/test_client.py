@@ -56,6 +56,7 @@ from davit.models import (
     Run,
     RunState,
     ShapeOverride,
+    StorageTier,
     TokenScope,
 )
 
@@ -552,6 +553,15 @@ def test_update_vm_is_patch_without_idempotency_key(make_client: Any) -> None:
     assert "If-Match" not in empty.headers
 
 
+def test_update_vm_pins_hot_and_reads_the_cold_tier(make_client: Any) -> None:
+    cold = vm_json(state="stopped", tier="cold", coldBytes=1 << 30, coldAt=NOW)
+    client, seen = make_client(lambda r: httpx.Response(200, json=cold))
+    vm = client.update_vm("web", keep=True, keep_hot=False)
+    assert json.loads(seen[0].content) == {"keep": True, "keepHot": False}
+    assert vm.tier == StorageTier.COLD and vm.cold_bytes == 1 << 30 and vm.cold_at is not None
+    assert vm.keep_hot is None
+
+
 def test_extend_and_rename_mirror_the_cli(make_client: Any) -> None:
     client, seen = make_client(lambda r: httpx.Response(200, json=vm_json()))
     client.extend_vm("web")
@@ -626,6 +636,19 @@ def test_create_vms_wait_reports_each_item(make_client: Any) -> None:
     assert second.error is not None
     paths = [r.url.path for r in seen][1:]
     assert paths == ["/api/v1/operations/op_1/events", "/api/v1/vms/vm_1"]
+
+
+def test_prune_images_posts_dry_run(make_client: Any) -> None:
+    blob = {"digest": "sha256:" + "a" * 64, "bytes": 4096, "changedAt": "2026-10-01T00:00:00Z"}
+    body = {"dryRun": True, "removed": [blob], "kept": 2, "bytes": 4096}
+    client, seen = make_client(lambda r: httpx.Response(200, json=body))
+    res = client.prune_images(dry_run=True)
+    client.prune_images()
+    first, second = seen
+    assert first.method == "POST" and first.url.path == "/api/v1/images/prune"
+    assert json.loads(first.content) == {"dryRun": True}
+    assert json.loads(second.content) == {}
+    assert res.kept == 2 and res.removed[0].bytes == 4096
 
 
 def test_reclaim_vms_posts_without_a_key(make_client: Any) -> None:

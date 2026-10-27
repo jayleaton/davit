@@ -3,6 +3,10 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -243,5 +247,39 @@ func TestLongPollCapPerGrant(t *testing.T) {
 	hold("")
 	if err := poll(""); !domain.IsCode(err, domain.CodeResourceExhausted) {
 		t.Fatalf("the owner beyond its own per-caller cap: %v", err)
+	}
+}
+
+// TestEveryEventTypeFilters: every event type api/events.go declares is
+// one a listEvents or webhook filter accepts (ParseTypes), so a client can
+// ask for it by name.
+func TestEveryEventTypeFilters(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "../../api/events.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.CONST {
+			continue
+		}
+		for _, s := range g.Specs {
+			v := s.(*ast.ValueSpec)
+			for i, name := range v.Names {
+				lit, ok := v.Values[i].(*ast.BasicLit)
+				if !strings.HasPrefix(name.Name, "Event") || !ok || lit.Kind != token.STRING {
+					continue
+				}
+				typ, _ := strconv.Unquote(lit.Value)
+				if _, err := events.ParseTypes(typ); err != nil {
+					t.Errorf("api.%s = %q: %v", name.Name, typ, err)
+				}
+				n++
+			}
+		}
+	}
+	if n < 10 {
+		t.Fatalf("found %d event types in api/events.go", n)
 	}
 }

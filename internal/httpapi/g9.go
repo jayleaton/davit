@@ -15,6 +15,21 @@ func (s *Server) g9Routes(route func(string, access, handler)) {
 	route("POST "+b+"/vms/{vmId}/recover", onVM(api.TokenAdmin), s.recoverVM)
 	route("POST "+b+"/vms/batch", allVMs(api.TokenAdmin), s.createVMs)
 	route("POST "+b+"/vms/reclaim", allVMs(api.TokenAdmin), s.reclaimVMs)
+	route("POST "+b+"/images/prune", ownerOnly, s.pruneImages)
+}
+
+// pruneImages is POST /images/prune: remove the image blobs nothing uses
+// (lifecycle.PruneImages); host owner only.
+func (s *Server) pruneImages(w http.ResponseWriter, r *http.Request) error {
+	var body api.PruneImagesRequest
+	if err := decode(r, &body, false); err != nil {
+		return err
+	}
+	res, err := s.svc.PruneImages(r.Context(), principal(r), body)
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, http.StatusOK, res)
 }
 
 // reclaimVMs is POST /vms/reclaim (feature capacityReclaim): stop the

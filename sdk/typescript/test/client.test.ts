@@ -511,6 +511,18 @@ describe("wait", () => {
     assert.deepEqual(t.calls.slice(2).map((c) => c.path), ["/api/v1/operations/op_1/events?after=0&waitMs=25000", "/api/v1/vms/vm_1"]);
   });
 
+  test("pruneImages posts dryRun", async () => {
+    const blob = { digest: "sha256:" + "a".repeat(64), bytes: 4096, changedAt: "2026-10-01T00:00:00Z" };
+    const t = fake(() => json(200, { dryRun: true, removed: [blob], kept: 2, bytes: 4096 }));
+    const c = new DavitClient({ transport: t });
+    const res = await c.pruneImages({ dryRun: true });
+    await c.pruneImages();
+    assert.equal(`${t.calls[0]!.method} ${t.calls[0]!.path}`, "POST /api/v1/images/prune");
+    assert.deepEqual(JSON.parse(t.calls[0]!.body as string), { dryRun: true });
+    assert.deepEqual(JSON.parse(t.calls[1]!.body as string), {});
+    assert.equal(res.kept, 2);
+  });
+
   test("reclaimVMs posts the filter without an Idempotency-Key", async () => {
     const item = { vmId: "vm_1", name: "web", idleSeconds: 700, memoryBytes: 1 << 30 };
     const t = fake(() => json(200, { items: [item] }));
@@ -608,6 +620,15 @@ describe("updateVM, extendVM, renameVM, type", () => {
     await c.updateVM("web", {});
     assert.deepEqual(JSON.parse(t.calls[1]!.body as string), {});
     assert.equal(t.calls[1]!.headers["If-Match"], undefined);
+  });
+
+  test("updateVM sends keep and keepHot; a cold VM reports its tier", async () => {
+    const t = fake(() => json(200, { ...vmBody, state: "stopped", tier: "cold", coldBytes: 1 << 30 }));
+    const c = new DavitClient({ transport: t });
+    const vm = await c.updateVM("web", { keep: true, keepHot: false });
+    assert.deepEqual(JSON.parse(t.calls[0]!.body as string), { keep: true, keepHot: false });
+    assert.equal(vm.tier, "cold");
+    assert.equal(vm.coldBytes, 1 << 30);
   });
 
   test("extendVM mirrors the CLI; renameVM sends the name", async () => {

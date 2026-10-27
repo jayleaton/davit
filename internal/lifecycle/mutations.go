@@ -34,6 +34,9 @@ type Request struct {
 	// CapacityWait is how long a create or resume may queue for host
 	// capacity (waitSeconds) when idle VMs could not make room (reclaim.go).
 	CapacityWait time.Duration
+	// CapacitySnapshot is the snapshot a queued create boots from, which the
+	// low-disk cleanup must not delete while it waits.
+	CapacitySnapshot string
 }
 
 // Accepted is the result of a lifecycle mutation.
@@ -287,31 +290,49 @@ func envList(env map[string]string) ([]string, error) {
 }
 
 // admit reserves host capacity for want: CPU/RAM/disk limits plus the
-// data dir free-space floor. Stop and delete never call it, so space can
-// always be reclaimed.
-func (s *Service) admit(tx *state.Tx, want domain.Shape) error {
-	if s.cfg.FreeSpace != nil {
-		free, err := s.cfg.FreeSpace()
-		if err != nil {
-			return fmt.Errorf("measure free space: %w", err)
-		}
-		if err := s.cfg.Limits.AdmitFreeSpace(free); err != nil {
-			return err
-		}
+// growth headroom of a VM of shape boot above the data dir's free-space
+// floor (disk.go). Stop and delete never call it, so space can always be
+// reclaimed.
+func (s *Service) admit(tx *state.Tx, want, boot domain.Shape) error {
+	return s.admitRestoring(tx, want, boot, 0)
+}
+
+// admitRestoring is admit for a VM whose boot first copies restore bytes
+// back from cold storage (coldtier.go): they are disk it needs too.
+func (s *Service) admitRestoring(tx *state.Tx, want, boot domain.Shape, restore int64) error {
+	u, err := liveUsage(tx, s.cfg.Limits)
+	if err != nil {
+		return err
 	}
 	used, err := tx.Allocated()
 	if err != nil {
 		return err
 	}
-	err = s.admitHost(tx, want)
+	err = s.admitHost(u, want)
 	if err == nil {
 		err = s.cfg.Limits.Admit(used, want)
 	}
 	if domain.IsRoomError(err) {
 		// What the VM needs, for the capacity queue (reclaim.go).
-		err = domain.AsError(err).WithDetail("vmMemoryBytes", want.MemoryBytes)
+		return domain.AsError(err).WithDetail("vmMemoryBytes", want.MemoryBytes)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// Last, so that a request the limits refuse anyway never queues (and
+	// runs the low-disk cleanup) for disk space.
+	if d, ok, err := s.diskUsage(); err != nil {
+		return err
+	} else if ok {
+		err := s.cfg.Limits.AdmitDisk(d, u.pendingDisk, s.cfg.Limits.DiskHeadroom(boot)+restore)
+		if restore > 0 && domain.IsDiskSpaceError(err) {
+			e := domain.AsError(err)
+			e.Message = fmt.Sprintf("restoring from cold storage needs %s: %s", domain.HumanBytes(restore), e.Message)
+			return e.WithDetail("restoreBytes", restore)
+		}
+		return err
+	}
+	return nil
 }
 
 // rearmReserve restores the journal's space reserve after a disk-full
@@ -320,10 +341,8 @@ func (s *Service) rearmReserve() {
 	if s.cfg.DB.ReserveArmed() {
 		return
 	}
-	if s.cfg.FreeSpace != nil {
-		if free, err := s.cfg.FreeSpace(); err != nil || s.cfg.Limits.AdmitFreeSpace(free) != nil {
-			return
-		}
+	if d, ok, err := s.diskUsage(); err != nil || ok && d.FreeBytes < s.cfg.Limits.DiskFloor(d.TotalBytes) {
+		return
 	}
 	if err := s.cfg.DB.Rearm(); err != nil {
 		s.cfg.Log.Warn("journal space reserve still unavailable", "err", err)
@@ -346,7 +365,7 @@ func (s *Service) newVM(tx *state.Tx, now time.Time, owner domain.PrincipalID, n
 	if !domain.ValidName(name) {
 		return nil, domain.Errorf(domain.CodeInvalidArgument, "invalid name %q: use 1-63 lowercase letters, digits and '-'", name).WithDetail("field", "name")
 	}
-	if err := s.admit(tx, shape); err != nil {
+	if err := s.admit(tx, shape, shape); err != nil {
 		return nil, err
 	}
 	op.VMID = id
@@ -376,6 +395,7 @@ func (s *Service) Create(ctx context.Context, req Request, body api.CreateVMRequ
 	if err := validWait(req.CapacityWait); err != nil {
 		return nil, err
 	}
+	req.CapacitySnapshot = string(body.SnapshotID)
 	return s.withRoom(ctx, req, req.CapacityWait, func() (*Accepted, error) { return s.create(ctx, req, body) })
 }
 
@@ -397,7 +417,7 @@ func (s *Service) create(ctx context.Context, req Request, body api.CreateVMRequ
 		if err != nil {
 			return p.op, err
 		}
-		rec.VM.Labels, rec.VM.IdleTimeoutSeconds = body.Labels, body.IdleTimeoutSeconds
+		rec.VM.Labels, rec.VM.IdleTimeoutSeconds, rec.VM.Keep = body.Labels, body.IdleTimeoutSeconds, body.Keep
 		if body.Environment == nil && body.Privacy == nil {
 			return p.op, tx.PutVM(rec)
 		}
@@ -611,6 +631,7 @@ func (s *Service) Resume(ctx context.Context, req Request, ref string, body api.
 		return nil, err
 	}
 	req.VMRef = ref
+	s.cancelDemoteRef(ctx, req.Principal, ref) // coldtier.go
 	// A ready or running VM needs no room (its resume is a no-op or a
 	// refused resize): answer at once, never behind the capacity queue.
 	if acc, err := s.resume(ctx, req, ref, body, true); !errors.Is(err, errNotUp) {
@@ -656,8 +677,9 @@ func (s *Service) resume(ctx context.Context, req Request, ref string, body api.
 			return nil, err
 		}
 		// Disk is already reserved by the stopped VM; admit CPU and memory
-		// of the shape it boots, plus any disk growth.
-		if err := s.admit(tx, resizeAdmission(vm.Shape, shape)); err != nil {
+		// of the shape it boots, plus any disk growth and, for a cold VM,
+		// the copy back to hot storage.
+		if err := s.admitRestoring(tx, resizeAdmission(vm.Shape, shape), shape, coldRestore(*vm)); err != nil {
 			return nil, err
 		}
 		src := vm.LastSnapshotID
@@ -694,6 +716,14 @@ func (s *Service) resume(ctx context.Context, req Request, ref string, body api.
 // Delete accepts deletion. Access closes immediately; data is collected
 // before the operation succeeds. Named snapshots survive.
 func (s *Service) Delete(ctx context.Context, req Request, ref string) (*Accepted, error) {
+	s.cancelDemoteRef(ctx, req.Principal, ref)
+	return s.deleteVM(ctx, req, ref, "", "", nil)
+}
+
+// deleteVM is Delete; a delete the host decides on its own carries reason
+// (Operation.reason) and why (VM.deleteReason), and check, if set, vetoes it
+// inside the transaction (the VM changed since it was chosen).
+func (s *Service) deleteVM(ctx context.Context, req Request, ref, reason, why string, check func(tx *state.Tx, rec *state.VMRecord) error) (*Accepted, error) {
 	req.VMRef = ref
 	return s.mutate(ctx, req, struct{}{}, false, func(tx *state.Tx, now time.Time) (*domain.Operation, error) {
 		rec, err := lookupVM(tx, req.Principal, ref)
@@ -703,7 +733,13 @@ func (s *Service) Delete(ctx context.Context, req Request, ref string) (*Accepte
 		if err := checkMutable(rec, req); err != nil {
 			return nil, err
 		}
-		op := &domain.Operation{ID: domain.NewOperationID(), Kind: domain.OpDelete, VMID: rec.VM.ID, Phase: "queued",
+		if check != nil {
+			if err := check(tx, rec); err != nil {
+				return nil, err
+			}
+		}
+		rec.VM.DeleteReason = why
+		op := &domain.Operation{ID: domain.NewOperationID(), Kind: domain.OpDelete, VMID: rec.VM.ID, Phase: "queued", Reason: reason,
 			Params: domain.OpParams{Generation: rec.VM.InstanceGeneration}}
 		if err := rec.VM.Transition(domain.StateDeleting, now); err != nil {
 			return nil, err
@@ -735,6 +771,9 @@ func keepSet(tx *state.Tx) (storage.KeepSet, error) {
 	for _, r := range vms {
 		if r.VM.State == domain.StateDeleted || r.VM.State == domain.StateDeleting {
 			continue
+		}
+		for _, c := range r.ColdCommits {
+			k.Cold = append(k.Cold, storage.CommitID(c))
 		}
 		for _, d := range []string{r.DiskID, r.RetainedDiskID} {
 			if d != "" {
@@ -775,6 +814,9 @@ func keepSet(tx *state.Tx) (storage.KeepSet, error) {
 func (s *Service) Update(ctx context.Context, req Request, ref string, body api.UpdateVMRequest) (*domain.VM, error) {
 	if req.Principal == "" {
 		return nil, domain.Errorf(domain.CodeUnauthenticated, "no principal")
+	}
+	if body.KeepHot != nil && *body.KeepHot {
+		s.cancelDemoteRef(ctx, req.Principal, ref)
 	}
 	var eg *egressChange
 	if body.Egress != nil {
@@ -829,6 +871,12 @@ func (s *Service) Update(ctx context.Context, req Request, ref string, body api.
 			}
 			vm.IdleTimeoutSeconds, changed = *body.IdleTimeoutSeconds, true
 			s.touch(vm.ID, now) // the countdown starts now
+		}
+		if body.Keep != nil && *body.Keep != vm.Keep {
+			vm.Keep, changed = *body.Keep, true
+		}
+		if body.KeepHot != nil && *body.KeepHot != vm.KeepHot {
+			vm.KeepHot, changed = *body.KeepHot, true
 		}
 		if body.Privacy != nil && *body.Privacy != vm.Privacy {
 			if err := setPrivacy(tx, rec, *body.Privacy); err != nil { // privacy.go

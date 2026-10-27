@@ -38,6 +38,13 @@ func TestStoreContract(t *testing.T) {
 			})
 		})
 	}
+	// A cold tier (tier.go) changes nothing about the contract.
+	t.Run("with cold tier", func(t *testing.T) {
+		runContract(t, func(t *testing.T) (Store, string) {
+			s, root, _ := tiered(t)
+			return s, root
+		})
+	})
 }
 
 // runContract checks the Store contract against any implementation.

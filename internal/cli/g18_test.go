@@ -138,7 +138,8 @@ func TestTokenOps(t *testing.T) {
 func toJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
 // TestVersionCheck: a release directory's release.json is read; GitHub's
-// latest-release redirect gives the tag; anything unreachable is "unknown";
+// latest-release redirect gives the tag, or the newest prerelease while there
+// are only prereleases; anything unreachable is "unknown";
 // nothing ever fails the command.
 func TestVersionCheck(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -164,6 +165,22 @@ func TestVersionCheck(t *testing.T) {
 	t.Setenv("DAVIT_RELEASE_URL", "")
 	if r := runCLI(t, false, "version", "--check"); r.code != 0 || r.data["latest"] != "v98.1.0" {
 		t.Fatalf("github: %d %+v", r.code, r.data)
+	}
+	// Only prereleases: the latest-release page goes to the release list, and
+	// the newest prerelease is the answer.
+	pre := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases/latest" {
+			http.Redirect(w, r, "/jayleaton/davit/releases", http.StatusFound)
+			return
+		}
+		w.Write([]byte(`[{"tag_name": "v98.2.0-rc3", "draft": false, "prerelease": true}]`))
+	}))
+	defer pre.Close()
+	oldAPI := releasesAPIURL
+	latestReleaseURL, releasesAPIURL = pre.URL+"/releases/latest", pre.URL+"/repos/jayleaton/davit/releases"
+	defer func() { releasesAPIURL = oldAPI }()
+	if r := runCLI(t, false, "version", "--check"); r.code != 0 || r.data["latest"] != "v98.2.0-rc3" || r.data["source"] != releasesAPIURL {
+		t.Fatalf("prereleases only: %d %+v", r.code, r.data)
 	}
 	for _, c := range []struct{ cur, latest, want string }{
 		{"1.2.3", "v1.2.3", "up-to-date"},

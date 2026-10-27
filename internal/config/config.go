@@ -74,6 +74,13 @@ type Daemon struct {
 	// TTLWarning is how long before an auto-stop the host warns (VM
 	// autoStopWarningAt, a guest broadcast); default 10m, negative disables.
 	TTLWarning Duration `json:"ttlWarning,omitempty"`
+	// AutoDelete configures the low-disk cleanup's deletion of unused boxes
+	// (docs/vm-host.md#disk-space). The floor it frees to is
+	// limits.minFreeDiskBytes / limits.minFreeDiskPercent.
+	AutoDelete AutoDelete `json:"autoDelete,omitempty"`
+	// ColdStorage is the optional cold storage tier: stopped VMs unused
+	// for a while move there from the data dir (docs/storage-tiers.md).
+	ColdStorage ColdStorage `json:"coldStorage,omitempty"`
 	// Runs configures one-command runs (createRun).
 	Runs Runs `json:"runs,omitempty"`
 	// Profiles are administrator-defined VM shapes for `new/fork --type`.
@@ -92,6 +99,54 @@ type Daemon struct {
 	// install.sh's --from; DAVIT_RELEASE_URL overrides it. https:// or
 	// file://. Nothing is ever installed automatically.
 	ReleaseBaseURL string `json:"releaseBaseUrl,omitempty"`
+}
+
+// AutoDelete configures the low-disk cleanup's deletion of unused boxes.
+type AutoDelete struct {
+	// Enabled turns auto-delete on (default true). Off, the cleanup still
+	// collects garbage and stops idle boxes.
+	Enabled *bool `json:"enabled,omitempty"`
+	// InstanceMinAge and ImageMinAge are how long a stopped box instance,
+	// or a project image without instances, must have been unused before
+	// it may be deleted (default 72h and 24h).
+	InstanceMinAge Duration `json:"instanceMinAge,omitempty"`
+	ImageMinAge    Duration `json:"imageMinAge,omitempty"`
+	// MarginBytes is how far above the floor the cleanup frees before it
+	// stops (default 2 GiB).
+	MarginBytes int64 `json:"marginBytes,omitempty"`
+	// BlobMinAge is how long an unreferenced image blob must have been
+	// unchanged before the cleanup or `box image prune` removes it
+	// (default 1h).
+	BlobMinAge Duration `json:"blobMinAge,omitempty"`
+}
+
+// ColdStorage configures the cold storage tier.
+type ColdStorage struct {
+	// Dir is a directory on another, larger filesystem (XFS with
+	// reflink=1, like the data dir); empty: no cold tier.
+	Dir string `json:"dir,omitempty"`
+	// After is how long a stopped VM must be unused before it moves
+	// (default 6h).
+	After Duration `json:"after,omitempty"`
+	// BytesPerSecond caps a move's disk reads (default 100 MiB/s;
+	// negative: unlimited).
+	BytesPerSecond int64 `json:"bytesPerSecond,omitempty"`
+	// MinBytes is the least data of its own a VM's disk must hold to move
+	// (default 512 MiB; negative: any).
+	MinBytes int64 `json:"minBytes,omitempty"`
+	// MinFreeBytes and MinFreePercent are the cold filesystem's floor, the
+	// larger of the two (default 5 GiB and 10%; minFreeBytes negative: no
+	// floor). Moves never take it below; under it, unused cold boxes are
+	// auto-deleted.
+	MinFreeBytes   int64 `json:"minFreeBytes,omitempty"`
+	MinFreePercent int   `json:"minFreePercent,omitempty"`
+	// IOBusyPercent is the host I/O pressure (Linux PSI "some avg10",
+	// percent of time some task waited for I/O) above which moves wait
+	// (default 20; negative: never wait).
+	IOBusyPercent int `json:"ioBusyPercent,omitempty"`
+	// Drain moves nothing more to cold storage and brings every cold box
+	// back to the data dir, one at a time, to empty the tier.
+	Drain bool `json:"drain,omitempty"`
 }
 
 // Mac configures the macOS runtime (Virtualization.framework through a
@@ -423,6 +478,23 @@ func (c Daemon) Validate() error {
 		return fmt.Errorf("config: storage must be \"\", \"reflink\" or \"copy\"")
 	case c.StopAttempts < 0 || c.StopAttempts > 10:
 		return fmt.Errorf("config: stopAttempts must be 1..10 (0: the default, 3)")
+	case c.Limits.MinFreeDiskPercent > 90:
+		return fmt.Errorf("config: limits.minFreeDiskPercent must be at most 90 (0: the default, %d; negative: bytes only)", domain.DefaultMinFreeDiskPercent)
+	case c.Limits.DiskHeadroomPercent > 100:
+		return fmt.Errorf("config: limits.diskHeadroomPercent must be at most 100 (0: the default, %d; negative: none)", domain.DefaultDiskHeadroomPercent)
+	case c.AutoDelete.InstanceMinAge < 0 || c.AutoDelete.ImageMinAge < 0 || c.AutoDelete.MarginBytes < 0 || c.AutoDelete.BlobMinAge < 0:
+		return fmt.Errorf("config: autoDelete.instanceMinAge, imageMinAge, marginBytes and blobMinAge must not be negative (0: the defaults)")
+	case c.ColdStorage.Dir != "" && !filepath.IsAbs(c.ColdStorage.Dir):
+		return fmt.Errorf("config: coldStorage.dir must be an absolute path")
+	case c.ColdStorage.Dir != "" && (within(c.ColdStorage.Dir, c.DataDir) || within(c.DataDir, c.ColdStorage.Dir)):
+		return fmt.Errorf("config: coldStorage.dir and dataDir must not contain each other (cold storage belongs on another filesystem)")
+	case c.ColdStorage.After < 0:
+		return fmt.Errorf("config: coldStorage.after must not be negative (0: the default, 6h)")
+	case c.ColdStorage.MinFreePercent > 90:
+		return fmt.Errorf("config: coldStorage.minFreePercent must be at most 90 (0: the default, %d; negative: bytes only)", domain.DefaultMinFreeDiskPercent)
+	case c.ColdStorage.Dir == "" && (c.ColdStorage.After != 0 || c.ColdStorage.Drain || c.ColdStorage.BytesPerSecond != 0 ||
+		c.ColdStorage.MinBytes != 0 || c.ColdStorage.MinFreeBytes != 0 || c.ColdStorage.MinFreePercent != 0 || c.ColdStorage.IOBusyPercent != 0):
+		return fmt.Errorf("config: coldStorage settings need coldStorage.dir")
 	case c.Limits.MemoryOvercommit != 0 && !(c.Limits.MemoryOvercommit >= 1 && c.Limits.MemoryOvercommit <= 16):
 		return fmt.Errorf("config: limits.memoryOvercommit must be 1..16 (0: the default, %g)", domain.DefaultMemoryOvercommit)
 	}
@@ -467,6 +539,12 @@ func home() string {
 		return os.TempDir()
 	}
 	return h
+}
+
+// within reports whether path is dir or inside it.
+func within(path, dir string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	return err == nil && (rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // DefaultDataDir is $XDG_DATA_HOME/davit or ~/.local/share/davit on

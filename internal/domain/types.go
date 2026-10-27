@@ -57,11 +57,17 @@ func ValidName(name string) bool {
 // letters, digits, '.', '_' and '-', starting with a letter or digit;
 // values at most 255 bytes of printable ASCII.
 const (
-	MaxLabels        = 32
-	maxLabelKey      = 63
-	maxLabelValue    = 255
-	LabelBox         = "davit.box" // the project of a project box (davit box)
-	labelKeyAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789._-"
+	MaxLabels     = 32
+	maxLabelKey   = 63
+	maxLabelValue = 255
+	LabelBox      = "davit.box" // the project of a project box (davit box)
+	// LabelBoxInstance names a box instance; LabelBoxRole is BoxRoleImage on
+	// a project image's builder VM (BoxImageVM).
+	LabelBoxInstance   = LabelBox + ".instance"
+	LabelBoxRole       = LabelBox + ".role"
+	LabelBoxGeneration = LabelBox + ".generation"
+	BoxRoleImage       = "image"
+	labelKeyAlphabet   = "abcdefghijklmnopqrstuvwxyz0123456789._-"
 )
 
 // ValidateLabels checks a VM's labels.
@@ -204,6 +210,16 @@ type StorageInfo struct {
 	FastClone bool   `json:"fastClone"`
 }
 
+// StorageTier is the storage tier holding a VM's committed disk
+// (docs/storage-tiers.md): hot is the data dir's filesystem, cold
+// the optional slower, larger one stopped VMs move to when unused.
+type StorageTier string
+
+const (
+	TierHot  StorageTier = "hot"
+	TierCold StorageTier = "cold"
+)
+
 // VM is the durable record of a machine.
 type VM struct {
 	ID                 VMID        `json:"id"`
@@ -244,6 +260,23 @@ type VM struct {
 	// attached process stream or tunnel (ssh) activity (0: never). It is
 	// independent of the TTL.
 	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
+	// Keep exempts the VM (and, on a project image's builder, the image)
+	// from the host's low-disk auto-delete (`davit box pin`).
+	Keep bool `json:"keep,omitempty"`
+	// KeepHot keeps the VM on the hot storage tier: the host never moves it
+	// to cold storage (`davit box pin --hot`).
+	KeepHot bool `json:"keepHot,omitempty"`
+	// Tier is where the stopped VM's committed disk is: cold once the host
+	// moved it to its cold storage tier, so the next resume copies it back
+	// first (ColdBytes). Absent means hot.
+	Tier StorageTier `json:"tier,omitempty"`
+	// ColdBytes is the data a resume of a cold VM copies back to hot
+	// storage; ColdAt is when the VM went cold.
+	ColdBytes int64      `json:"coldBytes,omitempty"`
+	ColdAt    *time.Time `json:"coldAt,omitempty"`
+	// DeleteReason says why the host deleted a deleted VM on its own (the
+	// low-disk auto-delete); empty when its owner deleted it.
+	DeleteReason string `json:"deleteReason,omitempty"`
 	// LastActivityAt is the last exec, stream or tunnel activity this daemon
 	// run saw (or when the VM last became ready); computed on read for VMs
 	// with an idle timeout.
@@ -287,3 +320,10 @@ type Snapshot struct {
 	CommitID    string       `json:"-"` // storage commit; host-internal
 	CreatedAt   time.Time    `json:"createdAt"`
 }
+
+// BoxImageVM is the name of project's image builder VM; its named
+// snapshots BoxImageSnapshotPrefix(project)<n> are the image's generations.
+func BoxImageVM(project string) string { return project + "--" + BoxRoleImage }
+
+// BoxImageSnapshotPrefix prefixes the names of project's image generations.
+func BoxImageSnapshotPrefix(project string) string { return project + "-image-g" }

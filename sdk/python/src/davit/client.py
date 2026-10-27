@@ -106,6 +106,8 @@ from .models import (
     PromptOptions,
     PromptRequest,
     PromptState,
+    PruneImagesRequest,
+    PruneImagesResult,
     PushResult,
     PutCredentialRequest,
     ReclaimVMsRequest,
@@ -186,6 +188,7 @@ OPERATIONS: dict[str, tuple[str, str]] = {
     "createVM": ("POST", "/vms"),
     "createVMs": ("POST", "/vms/batch"),
     "reclaimVMs": ("POST", "/vms/reclaim"),
+    "pruneImages": ("POST", "/images/prune"),
     "getVM": ("GET", "/vms/{vmId}"),
     "updateVM": ("PATCH", "/vms/{vmId}"),
     "deleteVM": ("DELETE", "/vms/{vmId}"),
@@ -987,6 +990,18 @@ class Client:
         )
         return _decode(ReclaimVMsResult, self._call("reclaimVMs", body=body.to_dict()))
 
+    def prune_images(self, *, dry_run: bool = False) -> PruneImagesResult:
+        """Remove the host's image blobs that no image uses (``davit box image prune``).
+
+        Host owner only. A blob goes when no manifest names its digest, no
+        image the daemon serves uses it, and it has not changed for an hour.
+
+        Args:
+            dry_run: Only list the blobs, removing none.
+        """
+        body = PruneImagesRequest(dry_run=True if dry_run else None)
+        return _decode(PruneImagesResult, self._call("pruneImages", body=body.to_dict()))
+
     @overload
     def fork_vm(
         self,
@@ -1304,6 +1319,8 @@ class Client:
         auto_stop: bool | None = None,
         egress: Egress | None = None,
         privacy: PrivacyPolicy | None = None,
+        keep: bool | None = None,
+        keep_hot: bool | None = None,
         if_match: int | str | None = None,
     ) -> VM:
         """Rename a VM, change its TTL or replace its egress or privacy policy
@@ -1318,6 +1335,9 @@ class Client:
         Naturally idempotent: no ``Idempotency-Key`` is sent.
 
         Args:
+            keep: Pin (``True``) or unpin the VM against the low-disk auto-delete.
+            keep_hot: ``True`` keeps the VM off the host's cold storage tier;
+                ``False`` lets it go cold again.
             if_match: Expected ``state_revision``; a stale value raises
                 :class:`~davit.errors.RevisionMismatch`.
         """
@@ -1327,6 +1347,8 @@ class Client:
             auto_stop=auto_stop,
             egress=egress,
             privacy=privacy,
+            keep=keep,
+            keep_hot=keep_hot,
         )
         headers = {"If-Match": str(if_match)} if if_match is not None else None
         data = self._call("updateVM", {"vmId": vm}, body=body.to_dict(), headers=headers)

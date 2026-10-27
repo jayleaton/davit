@@ -23,7 +23,9 @@ func (noSpaceStore) CreateWritable(context.Context, storage.DiskID, string, int6
 // free-space floor, and an operation that hits ENOSPC while running.
 func TestDiskFullExitCode(t *testing.T) {
 	t.Run("below floor", func(t *testing.T) {
-		serveWith(t, func(c *lifecycle.Config) { c.FreeSpace = func() (int64, error) { return 10 * domain.MiB, nil } })
+		serveWith(t, func(c *lifecycle.Config) {
+			c.DiskSpace = func() (domain.DiskUsage, error) { return domain.DiskUsage{FreeBytes: 10 * domain.MiB}, nil }
+		})
 		r := runCLI(t, false, "new", "web")
 		if r.code != ExitExhaustion || r.last.Error == nil || r.last.Error.Code != domain.CodeResourceExhausted ||
 			!r.last.Error.Retryable || r.last.Error.Origin != "server" {

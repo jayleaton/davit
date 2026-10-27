@@ -56,9 +56,14 @@ func CapacityTicket(key string) string {
 	return hex.EncodeToString(h[:8])
 }
 
-// IsRoomError reports whether err is an admission refusal that stopping VMs
-// can lift (memory, live VM count or CPU), as opposed to disk.
+// IsRoomError reports whether err is an admission refusal that may lift
+// while the request waits: memory, live VM count or CPU (stopping idle VMs
+// frees them) or free disk space (IsDiskSpaceError; the low-disk cleanup
+// frees it). The disk allocation limit (limits.diskBytes) is not.
 func IsRoomError(err error) bool {
+	if IsDiskSpaceError(err) {
+		return true
+	}
 	var e *Error
 	if !errors.As(err, &e) || e.Code != CodeResourceExhausted {
 		return false
@@ -107,9 +112,11 @@ func (l Limits) AdmitVMs(live int) error {
 }
 
 // Slots returns how many more VMs of shape admission would accept, given
-// the allocation used, the live VM count and the host's available memory
-// and free disk (negative: not measured, no bound). It is at most MaxSlots.
-func (l Limits) Slots(used Shape, live int, freeMemory, freeDisk int64, shape Shape) int {
+// the allocation used, the live VM count, the host's available memory
+// (negative: not measured, no bound), the data dir's filesystem (nil: not
+// measured) and the disk headroom reserved for VMs still provisioning. It
+// is at most MaxSlots.
+func (l Limits) Slots(used Shape, live int, freeMemory int64, disk *DiskUsage, reservedDisk int64, shape Shape) int {
 	n := MaxSlots
 	bound := func(room, each int64) {
 		if each > 0 {
@@ -128,8 +135,13 @@ func (l Limits) Slots(used Shape, live int, freeMemory, freeDisk int64, shape Sh
 	if l.DiskBytes > 0 {
 		bound(l.DiskBytes-used.DiskBytes, shape.DiskBytes)
 	}
-	if freeDisk >= 0 && l.AdmitFreeSpace(freeDisk) != nil {
-		n = 0
+	if floor := l.DiskFloor(0); disk != nil && floor > 0 {
+		room := disk.FreeBytes - reservedDisk - l.DiskFloor(disk.TotalBytes)
+		if each := l.DiskHeadroom(shape); each > 0 {
+			bound(room, each)
+		} else if room < 0 {
+			n = 0
+		}
 	}
 	if floor := l.MemoryFloor(); freeMemory >= 0 && floor > 0 {
 		bound(freeMemory-floor, shape.MemoryBytes)

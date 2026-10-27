@@ -254,6 +254,15 @@ func TestEveryMutationIsIdempotent(t *testing.T) {
 		a.must("DELETE", vmPath("idem-gc"), nil, "k-gc-delete", &acc)
 		a.waitOp(string(acc.Operation.ID))
 	}
+	natural["pruneImages"] = func() {
+		// No key: a repeat finds nothing left to remove.
+		var r1, r2 api.PruneImagesResult
+		a.must("POST", "/images/prune", api.PruneImagesRequest{}, "", &r1)
+		a.must("POST", "/images/prune", api.PruneImagesRequest{}, "", &r2)
+		if len(r2.Removed) != 0 {
+			t.Fatalf("pruneImages twice: %+v / %+v", r1, r2)
+		}
+	}
 	keyed["stopVM"] = func() {
 		r1, r2 := twice[api.OperationAccepted](a, "POST", vmPath("idem")+"/stop", api.StopVMRequest{}, "k-stop")
 		sameOp("stopVM", r1, r2)

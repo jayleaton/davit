@@ -130,7 +130,7 @@ func TestFreeSpaceFloor(t *testing.T) {
 	free := new(atomic.Int64)
 	free.Store(100 * domain.GiB)
 	e := newEnv(t, fake.Options{}, func(c *Config) {
-		c.FreeSpace = func() (int64, error) { return free.Load(), nil }
+		c.DiskSpace = func() (domain.DiskUsage, error) { return domain.DiskUsage{FreeBytes: free.Load()}, nil }
 		c.Limits.MinFreeDiskBytes = 2 * domain.GiB
 	})
 	ctx := context.Background()

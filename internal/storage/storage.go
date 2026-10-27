@@ -61,6 +61,8 @@ type Commit struct {
 	SizeBytes int64
 	Digest    string // "sha256:<hex>" of the manifest, not the full data
 	CreatedAt time.Time
+	// Tier is where the data is: hot (the store root) or cold (tier.go).
+	Tier domain.StorageTier
 }
 
 // CommitFile is an open, read-only commit (Store.OpenCommit). Its file never
@@ -109,6 +111,10 @@ type Store interface {
 type KeepSet struct {
 	Disks   []DiskID
 	Commits []CommitID
+	// Cold are the kept commits the caller recorded on the cold tier:
+	// their hot copy goes once the cold one is published. Any other kept
+	// commit keeps its hot copy and loses a cold duplicate (tier.go).
+	Cold []CommitID
 }
 
 // Collected reports what Collect removed.
@@ -116,4 +122,6 @@ type Collected struct {
 	Disks   []DiskID
 	Commits []CommitID
 	Partial int
+	// Moved counts the duplicate copies of kept commits removed (tier.go).
+	Moved int
 }

@@ -195,18 +195,34 @@ var cloneHint = map[bool]string{
 	false: "use a btrfs or XFS (reflink=1) data dir",
 }[goruntime.GOOS == "darwin"]
 
-// ClassifyDiskSpace grades free bytes against the configured disk limit and
-// the admission floor (below which the daemon refuses new/fork/resume).
-func ClassifyDiskSpace(free, limit, floor int64) (Status, string, string) {
-	detail := fmt.Sprintf("%s free", humanBytes(free))
+// ClassifyDiskSpace grades the data dir's filesystem against the
+// configured disk limit and the admission floor (below which the daemon
+// refuses or queues new/fork/resume and its low-disk cleanup runs); it
+// warns below twice the floor.
+func ClassifyDiskSpace(d domain.DiskUsage, l domain.Limits) (Status, string, string) {
+	floor := l.DiskFloor(d.TotalBytes)
+	detail := fmt.Sprintf("%s free", humanBytes(d.FreeBytes))
+	if d.TotalBytes > 0 {
+		detail += fmt.Sprintf(" of %s", humanBytes(d.TotalBytes))
+	}
+	if floor > 0 {
+		detail += fmt.Sprintf(", floor %s", humanBytes(floor))
+	}
+	if r := l.SaveReserve(); r > 0 {
+		detail += fmt.Sprintf(", save reserve %s", humanBytes(r))
+	}
+	const fix = "free space: `" + buildinfo.Name + " box gc` stops idle boxes, `" + buildinfo.Name + " box rm` deletes boxes, `" +
+		buildinfo.Name + " box image prune` removes unused image blobs"
 	switch {
-	case floor > 0 && free < floor:
-		return Fail, detail + fmt.Sprintf(", below the admission floor %s: new, fork and resume are refused", humanBytes(floor)),
-			"free space (delete VMs or snapshots) or lower limits.minFreeDiskBytes"
-	case limit > 0 && free < limit:
-		return Warn, detail + fmt.Sprintf(", less than the configured disk limit %s", humanBytes(limit)),
+	case floor > 0 && d.FreeBytes < floor:
+		return Fail, detail + ": below the floor, new, fork and resume are refused or queued and unused boxes may be auto-deleted",
+			fix + "; or lower limits.minFreeDiskBytes / minFreeDiskPercent"
+	case floor > 0 && d.FreeBytes < 2*floor:
+		return Warn, detail + ": less than twice the floor", fix
+	case l.DiskBytes > 0 && d.FreeBytes < l.DiskBytes:
+		return Warn, detail + fmt.Sprintf(", less than the configured disk limit %s", humanBytes(l.DiskBytes)),
 			"VM disks are sparse but can fill up: free space or lower limits.diskBytes"
-	case free < 10*domain.GiB:
+	case d.FreeBytes < 10*domain.GiB:
 		return Warn, detail, "less than 10GiB free: images, snapshots and VM disks need room"
 	}
 	return Pass, detail, ""
@@ -214,13 +230,13 @@ func ClassifyDiskSpace(free, limit, floor int64) (Status, string, string) {
 
 func diskSpaceCheck(o Options) Check {
 	c := Check{ID: "disk_space", Title: "Free disk space"}
-	free, err := FreeBytes(existingAncestor(o.DataDir))
+	d, err := DiskSpace(existingAncestor(o.DataDir))
 	if err != nil {
 		c.Status, c.Detail = Warn, "cannot measure free space: "+err.Error()
 		c.Hint = "point dataDir at a mounted local filesystem"
 		return c
 	}
-	c.Status, c.Detail, c.Hint = ClassifyDiskSpace(free, o.Limits.DiskBytes, o.Limits.FreeFloor())
+	c.Status, c.Detail, c.Hint = ClassifyDiskSpace(d, o.Limits)
 	return c
 }
 

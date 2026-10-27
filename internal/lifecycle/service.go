@@ -86,10 +86,29 @@ type Config struct {
 	// readiness.
 	Identity GuestIdentity
 	Limits   domain.Limits
-	// FreeSpace reports free bytes in the data dir; with it, new/fork/resume
-	// are refused below Limits.FreeFloor() (the same floor `doctor` checks).
-	// Nil disables the floor.
-	FreeSpace func() (int64, error)
+	// DiskSpace measures the data dir's filesystem. With it, admission
+	// reserves each new, fork or resume's growth headroom against
+	// Limits.DiskFloor (the floor `doctor` checks), the save reserve is
+	// kept and the low-disk cleanup runs (diskclean.go). Nil disables them.
+	DiskSpace func() (domain.DiskUsage, error)
+	// SaveReserve is the space set aside for stops (diskreserve.go); nil
+	// keeps none.
+	SaveReserve SaveReserve
+	// SyncDisk flushes the data dir's filesystem so that DiskSpace sees the
+	// space a delete freed (XFS releases unlinked blocks in the background);
+	// nil skips it.
+	SyncDisk func() error
+	// AutoDelete is the low-disk cleanup's policy for unused boxes.
+	AutoDelete AutoDeletePolicy
+	// Cold is the cold storage tier (coldtier.go); nil: none. Storage
+	// must then be a storage.Tiered with its cold tier attached.
+	Cold *ColdPolicy
+	// ColdUnavailable says why the configured (or once used) cold tier is
+	// not attached; cold VMs cannot resume until it is back.
+	ColdUnavailable string
+	// ImageBlobs is the image blob store pruneImages and the low-disk
+	// cleanup prune (blobprune.go); nil: none.
+	ImageBlobs *BlobStore
 	// FreeMemory reports the host's available memory; with it, admission
 	// keeps Limits.MemoryFloor() available (capacity.go). Nil, or
 	// errors.ErrUnsupported, disables the check.
@@ -180,6 +199,23 @@ type Service struct {
 	queue []*waiter
 	// reclaimMu serializes making room (reclaim.go).
 	reclaimMu sync.Mutex
+	// cleanMu serializes the low-disk cleanup (diskclean.go), and guards
+	// lastGarbage, when it last collected garbage.
+	cleanMu     sync.Mutex
+	lastGarbage time.Time
+	// fruitless is the journal's change channel when a cleanup last freed
+	// nothing (at fruitlessAt); the next waits for it to close (cleanMu).
+	fruitless   <-chan struct{}
+	fruitlessAt time.Time
+	// saving counts stops in flight, which may be using the released save
+	// reserve (diskreserve.go).
+	saving int
+	// demoteMu runs one move to cold storage at a time and coldMu one cold
+	// sweep (coldtier.go); demoting cancels the move of a VM in flight and
+	// coldSkip holds the revision at which a VM measured too small to move.
+	demoteMu, coldMu sync.Mutex
+	demoting         map[domain.VMID]context.CancelFunc
+	coldSkip         map[domain.VMID]int64
 }
 
 // New validates cfg and returns a service. Call Start before serving.
@@ -227,7 +263,15 @@ func New(cfg Config) (*Service, error) {
 	if cfg.TTLWarning < 0 {
 		cfg.TTLWarning = 0
 	}
-	s := &Service{cfg: cfg, caps: cfg.Runtime.Capabilities(), changed: make(chan struct{}), leases: map[domain.VMID]storage.Lease{}, warned: map[domain.VMID]time.Time{}, activity: map[domain.VMID]time.Time{}, preparing: map[domain.VMID]bool{}}
+	if cfg.Cold != nil {
+		if st, ok := cfg.Storage.(storage.Tiered); !ok {
+			return nil, errors.New("lifecycle: a cold storage tier needs a tiered store")
+		} else if _, attached := st.ColdProbe(); !attached {
+			return nil, errors.New("lifecycle: the store has no cold tier attached")
+		}
+	}
+	s := &Service{cfg: cfg, caps: cfg.Runtime.Capabilities(), changed: make(chan struct{}), leases: map[domain.VMID]storage.Lease{}, warned: map[domain.VMID]time.Time{}, activity: map[domain.VMID]time.Time{}, preparing: map[domain.VMID]bool{},
+		demoting: map[domain.VMID]context.CancelFunc{}, coldSkip: map[domain.VMID]int64{}}
 	if n := cfg.Limits.BootSlots(); n > 0 {
 		s.boots = make(chan struct{}, n)
 	}
@@ -249,6 +293,13 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("lifecycle: recovery: %w", err)
 	}
 	s.watchGoldens(ctx)
+	// Writing the save reserve may take a while where it cannot be
+	// preallocated; the sweeper retries it.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.rearmSaveReserve()
+	}()
 	s.wg.Add(1)
 	go s.sweeper()
 	s.kickWorkspaces(ctx) // re-drive preparation a restart interrupted
@@ -521,6 +572,15 @@ func (s *Service) leased(ctx context.Context, vm domain.VMID, now time.Time) boo
 // tombstones. The daemon calls it periodically; tests call it directly.
 func (s *Service) Sweep(ctx context.Context) error {
 	s.rearmReserve()
+	s.rearmSaveReserve()
+	if s.lowDisk() && s.ctx.Err() == nil {
+		// It waits for deletes: never hold up the TTL and idle stops below.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.freeDisk(s.ctx, 0, "")
+		}()
+	}
 	now := s.now()
 	var due, warn, idle []*state.VMRecord
 	// Housekeeping has its own transaction: a failure there must never stop
@@ -570,6 +630,9 @@ func (s *Service) Sweep(ctx context.Context) error {
 		}
 	}
 	s.stopIdle(ctx, idle, now)
+	if !s.lowDisk() {
+		s.coldSweep() // the low-disk cleanup moves VMs itself
+	}
 	for _, r := range due {
 		if s.leased(ctx, r.VM.ID, now) {
 			continue

@@ -19,9 +19,11 @@ __all__ = [
     "AppEndpointList",
     "AppEndpointState",
     "Arch",
+    "AutoDeletion",
     "BatchItem",
     "BootMode",
     "CapacityWaiter",
+    "ColdCapacity",
     "Consistency",
     "Conversation",
     "ConversationList",
@@ -114,6 +116,9 @@ __all__ = [
     "PromptRequest",
     "PromptState",
     "PromptUsage",
+    "PruneImagesRequest",
+    "PruneImagesResult",
+    "PrunedBlob",
     "PushResult",
     "PutCredentialRequest",
     "Readiness",
@@ -160,6 +165,7 @@ __all__ = [
     "StopVMRequest",
     "StorageCapabilities",
     "StorageInfo",
+    "StorageTier",
     "Token",
     "TokenList",
     "TokenScope",
@@ -246,6 +252,17 @@ class Arch(OpenEnum):
 
     AMD64 = "amd64"
     ARM64 = "arm64"
+
+
+class StorageTier(OpenEnum):
+    """Storage tier holding a VM's committed disk (docs/storage-tiers.md): `hot` is the data
+    dir's filesystem, `cold` the optional slower, larger one stopped VMs move to when unused.
+    VM.tier is `cold` once the host moved the stopped VM there, so the next resume copies it
+    back first (VM.coldBytes); absent means hot.
+    """
+
+    HOT = "hot"
+    COLD = "cold"
 
 
 class ErrorCode(OpenEnum):
@@ -385,6 +402,29 @@ class HostCapacity(Model):
     free_disk_bytes: int
     """Free space of the data dir."""
 
+    total_disk_bytes: int | None = None
+    """Size of the data dir's filesystem; absent where not measured."""
+
+    disk_floor_bytes: int | None = None
+    """Free-space floor admission keeps: the larger of `limits.minFreeDiskBytes` and
+    `limits.minFreeDiskPercent` of the filesystem. Below it new, fork and resume are refused
+    or queued and the low-disk cleanup runs. Absent when disabled or not measured.
+    """
+
+    disk_reserved_bytes: int | None = None
+    """Growth headroom reserved for VMs still provisioning, counted as used by admission."""
+
+    disk_headroom_bytes: int | None = None
+    """Free space admission reserves for a VM of the default shape to grow into
+    (`limits.diskHeadroomPercent` of its disk size).
+    """
+
+    save_reserve_bytes: int | None = None
+    """Space set aside so that stopping (committing) a running VM never fails for lack of space."""
+
+    save_reserve_armed: bool | None = None
+    """False while a stop is using the save reserve (or it could not be set aside)."""
+
     allocated: Shape
     limits: Limits
 
@@ -408,9 +448,17 @@ class HostCapacity(Model):
     waiting: list[CapacityWaiter]
     """Requests queued for capacity (`waitSeconds`), first in line first."""
 
+    cold: ColdCapacity | None = None
+
     _wire_ = (
         ("free_memory_bytes", "freeMemoryBytes", "int", True),
         ("free_disk_bytes", "freeDiskBytes", "int", True),
+        ("total_disk_bytes", "totalDiskBytes", "int", False),
+        ("disk_floor_bytes", "diskFloorBytes", "int", False),
+        ("disk_reserved_bytes", "diskReservedBytes", "int", False),
+        ("disk_headroom_bytes", "diskHeadroomBytes", "int", False),
+        ("save_reserve_bytes", "saveReserveBytes", "int", False),
+        ("save_reserve_armed", "saveReserveArmed", "bool", False),
         ("allocated", "allocated", "Shape", True),
         ("limits", "limits", "Limits", True),
         ("live_vms", "liveVms", "int", True),
@@ -419,6 +467,70 @@ class HostCapacity(Model):
         ("memory_budget_bytes", "memoryBudgetBytes", "int", False),
         ("reclaimable", "reclaimable", "int", True),
         ("waiting", "waiting", "list[CapacityWaiter]", True),
+        ("cold", "cold", "ColdCapacity", False),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ColdCapacity(Model):
+    """The cold storage tier (docs/storage-tiers.md): the filesystem stopped VMs unused for
+    `afterSeconds` move to. Absent from HostCapacity when none is configured and no VM is on
+    one.
+    """
+
+    free_bytes: int
+    """Free space of the cold filesystem."""
+
+    total_bytes: int | None = None
+    """Size of the cold filesystem; absent where not measured."""
+
+    floor_bytes: int | None = None
+    """Free space moving VMs to cold storage keeps there (`coldStorage.minFreeBytes` /
+    `minFreePercent` of its size).
+    """
+
+    after_seconds: int
+    """How long a stopped VM must be unused before the host moves it to cold storage."""
+
+    vms: int
+    """VMs on cold storage."""
+
+    bytes: int
+    """Data of the VMs on cold storage."""
+
+    fast_clone: bool
+    """Whether the cold filesystem supports reflink copies."""
+
+    detail: str | None = None
+    """The reflink probe's detail."""
+
+    same_filesystem: bool | None = None
+    """True when the cold directory is on the data dir's own filesystem: moving VMs there frees
+    nothing.
+    """
+
+    draining: bool | None = None
+    """True while the tier is being emptied (`coldStorage.drain`): nothing moves there and cold
+    VMs come back.
+    """
+
+    unavailable: str | None = None
+    """Why the cold tier is not in use although VMs are on it (its disk is missing, or it is no
+    longer configured); they cannot resume until it is back.
+    """
+
+    _wire_ = (
+        ("free_bytes", "freeBytes", "int", True),
+        ("total_bytes", "totalBytes", "int", False),
+        ("floor_bytes", "floorBytes", "int", False),
+        ("after_seconds", "afterSeconds", "int", True),
+        ("vms", "vms", "int", True),
+        ("bytes", "bytes", "int", True),
+        ("fast_clone", "fastClone", "bool", True),
+        ("detail", "detail", "str", False),
+        ("same_filesystem", "sameFilesystem", "bool", False),
+        ("draining", "draining", "bool", False),
+        ("unavailable", "unavailable", "str", False),
     )
 
 
@@ -434,11 +546,23 @@ class CapacityWaiter(Model):
     memory_bytes: int
     """Memory the request needs (0 if not known)."""
 
+    resource: str | None = None
+    """What the request's last refusal was for: `memory`, `vms`, `cpu` or `disk` (free space);
+    absent before it was refused.
+    """
+
+    disk_bytes: int | None = None
+    """Free space it needs (its growth headroom, the headroom reserved for VMs starting, and the
+    floor) when it waits for disk space.
+    """
+
     since: datetime
 
     _wire_ = (
         ("ticket", "ticket", "str", True),
         ("memory_bytes", "memoryBytes", "int", True),
+        ("resource", "resource", "str", False),
+        ("disk_bytes", "diskBytes", "int", False),
         ("since", "since", "datetime", True),
     )
 
@@ -452,7 +576,24 @@ class Limits(Model):
     disk_bytes: int
 
     min_free_disk_bytes: int | None = None
-    """Free-space floor of the data dir (0 = default, negative = disabled)."""
+    """Free-space floor of the data dir, at least this many bytes (0 = default 5 GiB, negative =
+    no floor: disk admission and the low-disk cleanup off).
+    """
+
+    min_free_disk_percent: int | None = None
+    """Free-space floor as a share of the filesystem; the floor is the larger of the two (0 =
+    default 10, negative = bytes only).
+    """
+
+    disk_headroom_percent: int | None = None
+    """Share of a VM's disk size admission reserves for its private growth (0 = default 25,
+    negative = none).
+    """
+
+    save_reserve_bytes: int | None = None
+    """Space set aside (a reserve file) that only stops may use (0 = default 2 GiB, negative =
+    none).
+    """
 
     vms: int | None = None
     """Live VMs at once (0 = unlimited)."""
@@ -483,6 +624,9 @@ class Limits(Model):
         ("memory_bytes", "memoryBytes", "int", True),
         ("disk_bytes", "diskBytes", "int", True),
         ("min_free_disk_bytes", "minFreeDiskBytes", "int", False),
+        ("min_free_disk_percent", "minFreeDiskPercent", "int", False),
+        ("disk_headroom_percent", "diskHeadroomPercent", "int", False),
+        ("save_reserve_bytes", "saveReserveBytes", "int", False),
         ("vms", "vms", "int", False),
         ("min_free_memory_bytes", "minFreeMemoryBytes", "int", False),
         ("concurrent_boots", "concurrentBoots", "int", False),
@@ -788,6 +932,29 @@ class VM(Model):
     tunnel (ssh) activity. Absent or 0: never. Independent of the TTL.
     """
 
+    keep: bool | None = None
+    """Pinned (`davit box pin`): never auto-deleted by the host's low-disk cleanup. On a project
+    image's builder VM it pins the image. Moving to cold storage is separate (`keepHot`).
+    """
+
+    keep_hot: bool | None = None
+    """Kept on hot storage (`davit box pin --hot`): the host never moves the VM to its cold
+    storage tier (docs/storage-tiers.md).
+    """
+
+    tier: StorageTier | None = None
+
+    cold_bytes: int | None = None
+    """The data a resume of a cold VM copies back to hot storage."""
+
+    cold_at: datetime | None = None
+    """When the VM went cold."""
+
+    delete_reason: str | None = None
+    """On a deleted VM the host deleted on its own (the low-disk cleanup's auto-delete): why,
+    with how long it was unused and the disk's state. Absent when its owner deleted it.
+    """
+
     last_activity_at: datetime | None = None
     """Last activity the idle timeout counts from (this daemon run's exec, stream or tunnel use,
     or the VM's last state change); present on ready/running VMs with an idle timeout.
@@ -823,6 +990,12 @@ class VM(Model):
         ("workspace", "workspace", "Workspace", False),
         ("labels", "labels", "map[str]", False),
         ("idle_timeout_seconds", "idleTimeoutSeconds", "int", False),
+        ("keep", "keep", "bool", False),
+        ("keep_hot", "keepHot", "bool", False),
+        ("tier", "tier", "StorageTier", False),
+        ("cold_bytes", "coldBytes", "int", False),
+        ("cold_at", "coldAt", "datetime", False),
+        ("delete_reason", "deleteReason", "str", False),
         ("last_activity_at", "lastActivityAt", "datetime", False),
     )
 
@@ -937,6 +1110,9 @@ class CreateVMRequest(Model):
     idle_timeout_seconds: int | None = None
     """Stop the VM after this long without activity (see VM.idleTimeoutSeconds)."""
 
+    keep: bool | None = None
+    """Pin the VM (see VM.keep)."""
+
     _wire_ = (
         ("name", "name", "str", False),
         ("type", "type", "str", False),
@@ -952,6 +1128,7 @@ class CreateVMRequest(Model):
         ("environment", "environment", "EnvironmentRef", False),
         ("labels", "labels", "map[str]", False),
         ("idle_timeout_seconds", "idleTimeoutSeconds", "int", False),
+        ("keep", "keep", "bool", False),
     )
 
 
@@ -1025,6 +1202,14 @@ class UpdateVMRequest(Model):
     idle_timeout_seconds: int | None = None
     """Replaces the idle timeout (0 disables it); the countdown restarts now."""
 
+    keep: bool | None = None
+    """Pins (true) or unpins the VM (see VM.keep)."""
+
+    keep_hot: bool | None = None
+    """True keeps the VM on hot storage (never moved to cold storage); false lets it go cold
+    again (see VM.keepHot).
+    """
+
     _wire_ = (
         ("name", "name", "str", False),
         ("ttl_seconds", "ttlSeconds", "int", False),
@@ -1032,6 +1217,8 @@ class UpdateVMRequest(Model):
         ("privacy", "privacy", "PrivacyPolicy", False),
         ("egress", "egress", "Egress", False),
         ("idle_timeout_seconds", "idleTimeoutSeconds", "int", False),
+        ("keep", "keep", "bool", False),
+        ("keep_hot", "keepHot", "bool", False),
     )
 
 
@@ -1135,6 +1322,89 @@ class ReclaimedVM(Model):
         ("idle_seconds", "idleSeconds", "int", True),
         ("memory_bytes", "memoryBytes", "int", True),
         ("operation_id", "operationId", "str", False),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PruneImagesRequest(Model):
+    """The ``PruneImagesRequest`` wire object."""
+
+    dry_run: bool | None = None
+    """List what would be removed without removing it."""
+
+    _wire_ = (("dry_run", "dryRun", "bool", False),)
+
+
+@dataclass(frozen=True, kw_only=True)
+class PruneImagesResult(Model):
+    """The ``PruneImagesResult`` wire object."""
+
+    dry_run: bool
+
+    removed: list[PrunedBlob]
+    """The removed (or removable) blobs, least recently changed first."""
+
+    kept: int
+    """Blobs that stay (referenced, or changed within the last hour)."""
+
+    bytes: int
+    """Space the removed blobs took on disk."""
+
+    _wire_ = (
+        ("dry_run", "dryRun", "bool", True),
+        ("removed", "removed", "list[PrunedBlob]", True),
+        ("kept", "kept", "int", True),
+        ("bytes", "bytes", "int", True),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PrunedBlob(Model):
+    """The ``PrunedBlob`` wire object."""
+
+    digest: str
+    bytes: int
+    changed_at: datetime
+
+    _wire_ = (
+        ("digest", "digest", "str", True),
+        ("bytes", "bytes", "int", True),
+        ("changed_at", "changedAt", "datetime", True),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class AutoDeletion(Model):
+    """The data of a `vm.autodeleted` event: an unused box the host's low-disk cleanup deleted."""
+
+    vm_id: str
+    name: str
+
+    box: str
+    """PROJECT/INSTANCE, or PROJECT for a project image."""
+
+    kind: str
+    """`image` or `instance`."""
+
+    last_used_at: datetime
+    unused_seconds: int
+
+    freed_bytes: int
+    """Free space the deletion gave back as measured (data shared with other boxes stays)."""
+
+    deleted_at: datetime
+    reason: str
+
+    _wire_ = (
+        ("vm_id", "vmId", "str", True),
+        ("name", "name", "str", True),
+        ("box", "box", "str", True),
+        ("kind", "kind", "str", True),
+        ("last_used_at", "lastUsedAt", "datetime", True),
+        ("unused_seconds", "unusedSeconds", "int", True),
+        ("freed_bytes", "freedBytes", "int", True),
+        ("deleted_at", "deletedAt", "datetime", True),
+        ("reason", "reason", "str", True),
     )
 
 
@@ -2365,9 +2635,9 @@ class TokenList(Model):
 class Event(Model):
     """One entry of the host event stream, in seq order. Types: vm.created, vm.state,
     operation.created, operation.state, operation.progress, run.created, run.state,
-    prompt.created, prompt.state, golden.evicted; tolerate unknown types. data is an
-    allowlisted summary (IDs, states, error codes): never environment values, prompt text or
-    secrets.
+    prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion);
+    tolerate unknown types. data is an allowlisted summary (IDs, states, error codes): never
+    environment values, prompt text or secrets.
     """
 
     seq: int

@@ -23,10 +23,13 @@ import (
 // setupBudget bounds one image setup run.
 const setupBudget = 2 * time.Hour
 
-// boxImage runs `box image build|update|rm PROJECT`.
+// boxImage runs `box image build|update|rm PROJECT` and `box image prune`.
 func (s *session) boxImage(ctx context.Context, o *opts, args []string) error {
+	if len(args) == 1 && args[0] == "prune" {
+		return s.imagePrune(ctx, o)
+	}
 	if len(args) < 1 || len(args) > 2 || args[0] != "build" && args[0] != "update" && args[0] != "rm" {
-		return usageErr("box image build [PROJECT] [--from IMAGE] [--setup FILE | --setup-cmd CMD] | box image update [PROJECT] [--setup ...] | box image rm [PROJECT] [--force] --yes")
+		return usageErr("box image build [PROJECT] [--from IMAGE] [--setup FILE | --setup-cmd CMD] | box image update [PROJECT] [--setup ...] | box image rm [PROJECT] [--force] --yes | box image prune [--dry-run]")
 	}
 	arg := defaultProject()
 	if len(args) == 2 {
@@ -523,6 +526,14 @@ type boxRow struct {
 	IdleTimeoutSeconds int64      `json:"idleTimeoutSeconds"`
 	LastActivityAt     *time.Time `json:"lastActivityAt,omitempty"`
 	UpdatedAt          time.Time  `json:"updatedAt"`
+	// Keep: pinned (`box pin`), never auto-deleted for disk space;
+	// KeepHot: never moved to cold storage either (`box pin --hot`).
+	Keep    bool `json:"keep,omitempty"`
+	KeepHot bool `json:"keepHot,omitempty"`
+	// Tier is where the box's disk is: hot, or cold (its next up copies
+	// ColdBytes back first).
+	Tier      domain.StorageTier `json:"tier"`
+	ColdBytes int64              `json:"coldBytes,omitempty"`
 }
 
 // boxList lists project images and instances (of one project, or all),
@@ -532,13 +543,16 @@ func (s *session) boxList(ctx context.Context, project string) error {
 	if err != nil {
 		return err
 	}
-	host, err := s.hostSummary(ctx, rows)
+	host, err := s.hostSummary(ctx, project, rows)
 	if err != nil {
 		return err
 	}
 	s.out.result("", map[string]any{"host": host, "items": rows})
 	if host != nil {
 		s.out.human("%s", host.line())
+		for _, d := range host.AutoDeleted {
+			s.out.human("  %s (`box ls --deleted` says why)", autoDeletedLine(d))
+		}
 	}
 	for _, r := range rows {
 		gen := "gen " + strconv.Itoa(r.Generation)
@@ -549,8 +563,21 @@ func (s *session) boxList(ctx context.Context, project string) error {
 		if r.LastActivityAt != nil && (r.State == string(domain.StateReady) || r.State == string(domain.StateRunning)) {
 			idle = "  idle " + time.Since(*r.LastActivityAt).Round(time.Second).String()
 		}
-		s.out.human("%-36s %-7s %-9s %-14s %3d cpu %8s  age %s%s", r.Project+"/"+r.Instance, r.Kind, r.State, gen,
-			r.CPUs, humanBytes(r.MemoryBytes), time.Since(r.CreatedAt).Round(time.Second), idle)
+		pin := ""
+		switch {
+		case r.Keep && r.KeepHot:
+			pin = "  pinned hot"
+		case r.Keep:
+			pin = "  pinned"
+		case r.KeepHot:
+			pin = "  kept hot"
+		}
+		tier := string(r.Tier)
+		if r.Tier == domain.TierCold {
+			tier += " (" + humanBytes(r.ColdBytes) + " to restore)"
+		}
+		s.out.human("%-36s %-7s %-9s %-4s %-14s %3d cpu %8s  age %s%s%s", r.Project+"/"+r.Instance, r.Kind, r.State, tier, gen,
+			r.CPUs, humanBytes(r.MemoryBytes), time.Since(r.CreatedAt).Round(time.Second), idle, pin)
 	}
 	if len(rows) == 0 {
 		s.out.human("no boxes; `%s box image build PROJECT` makes a project image, `%s box up PROJECT` an instance", buildinfo.Name, buildinfo.Name)
@@ -593,7 +620,10 @@ func (s *session) boxRows(ctx context.Context, project string) ([]boxRow, error)
 		}
 		r := boxRow{Project: p, VM: vm.Name, VMID: string(vm.ID), State: string(vm.State), CreatedAt: vm.CreatedAt,
 			CPUs: vm.Shape.CPUs, MemoryBytes: vm.Shape.MemoryBytes, DiskBytes: vm.Shape.DiskBytes, IdleTimeoutSeconds: vm.IdleTimeoutSeconds,
-			LastActivityAt: vm.LastActivityAt, UpdatedAt: vm.UpdatedAt}
+			LastActivityAt: vm.LastActivityAt, UpdatedAt: vm.UpdatedAt, Keep: vm.Keep, KeepHot: vm.KeepHot, Tier: vm.Tier, ColdBytes: vm.ColdBytes}
+		if r.Tier == "" {
+			r.Tier = domain.TierHot
+		}
 		switch {
 		case vm.Labels[labelBoxRole] == boxRoleImage && vm.Name == imageVM(p):
 			r.Kind, r.Instance = "image", imageInstance

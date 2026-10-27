@@ -42,11 +42,11 @@ import (
 
 // Box labels.
 const (
-	labelBoxInstance   = domain.LabelBox + ".instance"
-	labelBoxRole       = domain.LabelBox + ".role"
-	labelBoxGeneration = domain.LabelBox + ".generation"
-	boxRoleImage       = "image"
-	imageInstance      = "image" // reserved: the builder
+	labelBoxInstance   = domain.LabelBoxInstance
+	labelBoxRole       = domain.LabelBoxRole
+	labelBoxGeneration = domain.LabelBoxGeneration
+	boxRoleImage       = domain.BoxRoleImage
+	imageInstance      = domain.BoxRoleImage // reserved: the builder
 	defaultSetupFile   = ".davit/setup.sh"
 	legacySetupFile    = ".slipway/setup.sh" // the name before the davit rename, still read
 )
@@ -72,6 +72,9 @@ type boxOpts struct {
 	setup    string // a local script file
 	setupCmd string // or a shell command
 	dir      string // the tree to sync into the builder
+	keep     bool   // up: pin the box (never auto-deleted for disk space)
+	hot      bool   // pin: also keep the box on hot storage (never moved to cold)
+	deleted  bool   // ls: the boxes the host auto-deleted
 }
 
 // optDuration is a duration flag that knows whether it was given.
@@ -101,7 +104,10 @@ func boxFlags(fs *flag.FlagSet, o *opts) {
 	fs.Var(&o.box.idle, "idle", "stop the box after this long unused (default 15m, $"+BoxIdleEnv+"; 0s: never); gc: stop boxes idle at least this long (default 10m)")
 	fs.Var(&o.box.wait, "wait", "up/run/ssh/sync: when the host is full, wait this long in its queue for capacity (default 3m; 0s: fail at once)")
 	fs.Var(ageFlag{&o.box.rmOlder}, "rm-older-than", "gc: delete instances stopped at least this long, e.g. 7d (never a project image)")
-	fs.BoolVar(&o.box.dryRun, "dry-run", false, "gc: list what would be stopped or deleted")
+	fs.BoolVar(&o.box.dryRun, "dry-run", false, "gc: list what would be stopped or deleted; image prune: list the blobs it would remove")
+	fs.BoolVar(&o.box.keep, "keep", false, "up: pin the box, as `box pin` does: never auto-deleted when the host is low on disk")
+	fs.BoolVar(&o.box.hot, "hot", false, "pin: also keep the box on hot storage: never moved to the host's cold storage tier (unpin undoes both)")
+	fs.BoolVar(&o.box.deleted, "deleted", false, "ls: list the boxes the host auto-deleted for disk space in the last week, with why")
 	fs.BoolVar(&o.box.refresh, "refresh", false, "up: recreate the instance from the latest image generation (same CPUs and memory; the disk is discarded)")
 	fs.StringVar(&o.box.setup, "setup", "", "image build/update: setup script (default "+defaultSetupFile+", else "+legacySetupFile+", in the tree)")
 	fs.StringVar(&o.box.setupCmd, "setup-cmd", "", "image build/update: setup shell command instead of a script")
@@ -252,7 +258,19 @@ func runBoxCmd(ctx context.Context, s *session, o *opts, args []string) error {
 			}
 			project = p
 		}
+		if o.box.deleted {
+			return s.boxDeleted(ctx, project)
+		}
 		return s.boxList(ctx, project)
+	case "pin", "unpin":
+		if len(args) > 1 {
+			return usageErr("box %s [PROJECT[/INSTANCE] | PROJECT/image]", sub)
+		}
+		arg := ""
+		if len(args) == 1 {
+			arg = args[0]
+		}
+		return s.boxPin(ctx, arg, sub == "pin", o.box.hot)
 	case "gc":
 		if len(args) > 1 {
 			return usageErr("box gc [PROJECT] [--idle 10m] [--rm-older-than 7d] [--dry-run]")
@@ -476,6 +494,12 @@ func (s *session) boxUp(ctx context.Context, o *opts, ref boxRef, report bool) (
 	if refreshed {
 		action = "refreshed"
 	}
+	if o.box.keep && !vm.Keep {
+		keep := true
+		if err := s.cl.do(ctx, http.MethodPatch, vmPath(string(vm.ID)), nil, api.UpdateVMRequest{Keep: &keep}, nil, &vm); err != nil {
+			return vm, err
+		}
+	}
 	gen, _ := strconv.Atoi(vm.Labels[labelBoxGeneration])
 	res := boxUpResult{Box: ref.project + "/" + ref.instance, Project: ref.project, Instance: ref.instance, Action: action,
 		Generation: gen, Seconds: time.Since(start).Seconds(), SSHHost: sshHostPrefix + string(vm.ID), VM: vm}
@@ -510,7 +534,7 @@ func (s *session) instanceRequest(ctx context.Context, o *opts, ref boxRef) (*ap
 	}
 	no := false
 	body := &api.CreateVMRequest{Name: ref.vm(), Type: o.typ, Shape: s.newBoxShape(ctx, o, tree), AutoStop: &no, IdleTimeoutSeconds: int64(idle / time.Second),
-		Labels: map[string]string{domain.LabelBox: ref.project, labelBoxInstance: ref.instance, labelBoxGeneration: "0"}}
+		Labels: map[string]string{domain.LabelBox: ref.project, labelBoxInstance: ref.instance, labelBoxGeneration: "0"}, Keep: o.box.keep}
 	if len(gens) == 0 {
 		// The first instance of a project builds its image (the setup from
 		// .davit/setup.sh or detected from the tree; on --image, else the
@@ -629,6 +653,9 @@ func (s *session) ensureRunning(ctx context.Context, o *opts, name, project stri
 			}
 			continue
 		case domain.StateStopped, domain.StateError:
+			if vm.Tier == domain.TierCold {
+				s.out.diag("box %s: restoring from cold storage (%s)…", name, humanBytes(vm.ColdBytes))
+			}
 			body := api.ResumeVMRequest{Type: o.typ, Shape: o.shape()}
 			acc, err := s.capacityMutate(ctx, vmPath(name)+"/resume", body, o.boxWait())
 			if isCode(err, domain.CodeOperationInProgress) {

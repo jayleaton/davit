@@ -62,6 +62,46 @@ without prompts (the script uses `BatchMode`); one SSH connection is shared for 
 - **20 GiB free** on the reflink filesystem; RAM for three 512 MiB guests at once plus the build (8 GiB is
   comfortable).
 
+## A small filesystem for the disk-low test
+
+`TestFirecrackerDiskLow` (`./cmd/davit/`) checks disk admission, the save reserve, the low-disk auto-delete
+and `box image prune` ([vm-host.md](vm-host.md#disk-space-floor-reservation-and-auto-delete)) on a real
+filesystem that it fills on purpose, so it never uses the reflink scratch, the host's davit data dir or any
+filesystem other VMs live on. Give it a dedicated small XFS with reflink (at most 64 GiB; 16 GiB is enough) with
+`--small-fs DIR`; without one it skips. It works in `DIR/davit-disklow-*`, which the run's cleanup removes.
+Making the filesystem needs root, so it is yours to make and remove, for example as a loop file on a disk
+with room:
+
+```sh
+truncate -s 16G /var/tmp/davit-small.img
+mkfs.xfs -q -m reflink=1 /var/tmp/davit-small.img
+sudo mkdir -p /mnt/davit-small && sudo mount -o loop,discard /var/tmp/davit-small.img /mnt/davit-small
+sudo chown "$USER" /mnt/davit-small
+scripts/vm-tier.sh --small-fs /mnt/davit-small --pkg ./cmd/davit/ vmhost 'TestFirecrackerDiskLow$'
+sudo umount /mnt/davit-small && rm /var/tmp/davit-small.img
+```
+
+## A cold filesystem for the cold-tier test
+
+`TestFirecrackerColdTier` (`./cmd/davit/`) checks the cold storage tier on real guests: a stopped box moves to
+cold storage and back with a 1 GiB file intact (its log lines `COLD-DEMOTE` and `COLD-PROMOTE` carry the measured
+bytes and seconds), a running box never moves, and a daemon SIGKILLed in the middle of a move recovers with the
+box's data on exactly one tier. A move must cross filesystems, so the test needs two dedicated XFS filesystems with
+reflink: the hot one is `--small-fs DIR` (above) and the cold one is `--cold-fs DIR`; 24 GiB and 32 GiB were
+enough (the cold tier keeps 5 GiB free). Without both it skips. It works in `davit-cold-*` on each, which the
+run's cleanup removes. Make the second one as the first:
+
+```sh
+truncate -s 24G /var/tmp/davit-small.img && truncate -s 32G /var/tmp/davit-cold.img
+mkfs.xfs -q -m reflink=1 /var/tmp/davit-small.img && mkfs.xfs -q -m reflink=1 /var/tmp/davit-cold.img
+sudo mkdir -p /mnt/davit-small /mnt/davit-cold
+sudo mount -o loop,discard /var/tmp/davit-small.img /mnt/davit-small
+sudo mount -o loop,discard /var/tmp/davit-cold.img /mnt/davit-cold
+sudo chown "$USER" /mnt/davit-small /mnt/davit-cold
+scripts/vm-tier.sh --small-fs /mnt/davit-small --cold-fs /mnt/davit-cold --pkg ./cmd/davit/ vmhost 'TestFirecrackerColdTier$'
+sudo umount /mnt/davit-small /mnt/davit-cold && rm /var/tmp/davit-small.img /var/tmp/davit-cold.img
+```
+
 ## Prepare (once per host)
 
 ```sh

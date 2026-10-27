@@ -13,6 +13,7 @@ three ways: the API and CLI (`listEvents`, `davit events`), signed webhooks, or 
 | `run.created`, `run.state` | a run is created; its state changes | `state`, `previousState`, `exitCode`, `error` (code) |
 | `prompt.created`, `prompt.state` | a prompt turn starts; its state changes | `conversationId`, `harness`, `state`, `previousState`, `error` (code) |
 | `golden.evicted` | the host evicted a golden (a booted memory snapshot of an image or project image) to keep the data dir's free-space floor; the next create that needs it captures it again. Owned by the snapshot's owner for a project image (subject: the snapshot), else by the host owner (subject: the golden) | `goldenId`, `snapshotId` (project image), `imageDigest`, `bytes` (freed), `reason` |
+| `vm.autodeleted` | the host's low-disk cleanup deleted an unused box (a stopped instance, or a project image with no instances) to get free space back above the floor ([project-boxes.md](project-boxes.md#when-the-host-is-low-on-disk)). Owned by the box's owner; subject: the VM | `vmId`, `name`, `box`, `kind` (`image`, `instance`), `lastUsedAt`, `unusedSeconds`, `freedBytes`, `deletedAt`, `reason` |
 
 - **Ordering:** every event has a `seq`, a `time`, the `vmId` and a `subject` (the VM, operation, run or
   prompt ID).

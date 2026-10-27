@@ -49,8 +49,11 @@ type (
 	Egress           = domain.Egress
 	PrivacyPolicy    = domain.PrivacyPolicy
 	HostCapacity     = domain.HostCapacity
+	ColdCapacity     = domain.ColdCapacity
+	StorageTier      = domain.StorageTier
 	CapacityWaiter   = domain.CapacityWaiter
 	Limits           = domain.Limits
+	AutoDeletion     = domain.AutoDeletion
 )
 
 // ShapeOverride is a partial shape; zero fields keep the default/source value.
@@ -84,6 +87,9 @@ type CreateVMRequest struct {
 	// IdleTimeoutSeconds stops the VM after this long with no exec, process
 	// stream or tunnel activity (0 or omitted: never).
 	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds,omitempty"`
+	// Keep exempts the VM from the host's low-disk auto-delete (`davit box
+	// pin`).
+	Keep bool `json:"keep,omitempty"`
 }
 
 // ForkVMRequest is the body of forkVM.
@@ -121,6 +127,12 @@ type UpdateVMRequest struct {
 	Privacy *PrivacyPolicy `json:"privacy,omitempty"`
 	// IdleTimeoutSeconds replaces the VM's idle timeout (0: never).
 	IdleTimeoutSeconds *int64 `json:"idleTimeoutSeconds,omitempty"`
+	// Keep pins (true) or unpins the VM: a pinned VM, or a project image
+	// whose builder VM is pinned, is never auto-deleted for disk space.
+	Keep *bool `json:"keep,omitempty"`
+	// KeepHot (true) keeps the VM on hot storage: the host never moves it
+	// to its cold storage tier (`davit box pin --hot`).
+	KeepHot *bool `json:"keepHot,omitempty"`
 }
 
 // StopVMRequest is the body of stopVM.
@@ -549,6 +561,30 @@ type ReclaimVMsRequest struct {
 // activity first.
 type ReclaimVMsResult struct {
 	Items []ReclaimedVM `json:"items"`
+}
+
+// PruneImagesRequest is the body of pruneImages.
+type PruneImagesRequest struct {
+	// DryRun lists what would be removed without removing it.
+	DryRun bool `json:"dryRun,omitempty"`
+}
+
+// PruneImagesResult lists the image blobs pruneImages removed (or would
+// remove), least recently changed first.
+type PruneImagesResult struct {
+	DryRun  bool         `json:"dryRun"`
+	Removed []PrunedBlob `json:"removed"`
+	// Kept counts the blobs that stay (referenced, or changed too recently).
+	Kept int `json:"kept"`
+	// Bytes is the space the removed blobs took on disk.
+	Bytes int64 `json:"bytes"`
+}
+
+// PrunedBlob is one unreferenced image blob.
+type PrunedBlob struct {
+	Digest    string    `json:"digest"`
+	Bytes     int64     `json:"bytes"`
+	ChangedAt time.Time `json:"changedAt"`
 }
 
 // ReclaimedVM is one idle VM of reclaimVMs.

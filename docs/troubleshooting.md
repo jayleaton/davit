@@ -231,7 +231,7 @@ The first part depends on what ran out:
 | `live VMs reserve N MiB of the N MiB memory budget …` | the memory reservation (`limits.memoryBytes` × `limits.memoryOvercommit`) |
 | `host has N live VMs, the limit (limits.vms) is N` | the VM count limit |
 | `host cpu limit exceeded`, `host disk limit exceeded` | `limits.cpus`, `limits.diskBytes` |
-| `host data dir has N bytes free, below the N-byte floor` or `host disk is full` | disk space on the host |
+| `host disk low: X free, need Y (…)` or `host disk is full` | disk space on the host ([below](#host-disk-low)) |
 
 **Fix.** Free memory by stopping boxes, or disk by removing them. From your laptop:
 
@@ -255,3 +255,116 @@ do. Other options:
 
 [project-boxes.md](project-boxes.md#when-the-host-is-full) describes how the host makes room and queues
 requests.
+
+## Host disk low
+
+A box create or resume that would leave the host's data disk below its floor (the larger of 10% of the disk
+and 5 GiB) after reserving room for the box to grow waits in the queue, and stderr says:
+
+```text
+waiting for host disk space (0 ahead): host disk low: 6.0 GiB free, need 7.0 GiB; `davit box gc` stops idle boxes, `davit box rm` deletes ones you no longer need
+```
+
+When the wait runs out it fails with `resource_exhausted`, exit 8, and `host disk low: X free, need Y (…)`.
+`box down` and the host's own stops still work: a save reserve keeps room for them.
+
+While the disk is below the floor the host frees space by itself: it removes its own garbage, stops idle
+boxes, moves stopped boxes to its cold storage tier if it has one ([storage-tiers.md](storage-tiers.md)), and
+then deletes unused boxes, least recently used first (project images with no instances unused for a day,
+stopped instances unused for 3 days), never a pinned or running one. See what it deleted and why:
+
+```sh
+davit box ls                          # the host line shows disk free / floor / reserved, then auto-deleted boxes
+davit box ls --deleted                # each auto-deleted box with why
+davit box pin PROJECT/INSTANCE        # keep a box (PROJECT/image: the project image)
+```
+
+**Fix.** Disk comes back only by deleting, not by stopping:
+
+```sh
+davit box rm PROJECT/INSTANCE --yes   # a box and its disk
+davit box gc --rm-older-than 2d       # your instances stopped for at least 2 days
+davit box image rm PROJECT --yes      # a project image you no longer use
+davit box image prune                 # the host's image blobs no image uses (host owner)
+```
+
+On the host, `davit doctor` reports `disk_space` and `disk_admission` (free, floor, reserved) and warns
+below twice the floor. The floor, the growth reservation, the save reserve and auto-delete are set in the
+daemon's config ([vm-host.md](vm-host.md#disk-space-floor-reservation-and-auto-delete)).
+
+## Slow first resume
+
+```text
+box PROJECT/INSTANCE: restoring from cold storage (5.1 GiB)…
+```
+
+**What it means.** The box had been stopped and unused for a while (6 hours by default), so the host moved its
+disk to its cold storage tier, a slower disk. This resume copies it back first; the progress lines say how far
+it is (`storage.restore`). The resumes after it are fast again. How long the copy takes depends on the host's
+cold disk and the box's size.
+
+**Fix.** Nothing is wrong. For a box you resume often, pin it hot, so it never goes cold:
+
+```sh
+davit box pin --hot PROJECT/INSTANCE
+```
+
+The host administrator can make boxes wait longer before they go cold (`coldStorage.after`) or use a faster
+cold disk ([storage-tiers.md](storage-tiers.md#slow-first-resumes)).
+
+## Cold storage UNAVAILABLE
+
+```text
+host: …; cold storage UNAVAILABLE: N boxes on it cannot resume (REASON); …
+error: vm PROJECT--INSTANCE is on cold storage, which is unavailable: REASON (docs/storage-tiers.md#when-the-cold-disk-is-missing) (unavailable)
+```
+
+**What it means.** The daemon started without its cold storage disk: it was not mounted, the directory has no
+`davit-cold.json` (an empty mount point), it belongs to another davit store, or it is a network filesystem.
+Or the `coldStorage` block was removed from the config while boxes were still cold. Everything on the hot disk
+works; only the boxes on cold storage cannot resume. `davit doctor` fails its "Cold storage" check with the
+same reason.
+
+**Fix.** On the host, mount the disk (or put the `coldStorage` block back), then restart the daemon:
+
+```sh
+sudo mount /mnt/davit-cold          # your cold disk's mount point
+systemctl --user restart davit
+davit doctor
+```
+
+[storage-tiers.md](storage-tiers.md#when-the-cold-disk-is-missing) lists every reason.
+
+## Restoring from cold storage needs N GiB
+
+```text
+error: restoring from cold storage needs 5.1 GiB: host disk low: X free, need Y (…) (resource_exhausted)
+```
+
+**What it means.** The box is on cold storage, and its resume first copies it back to the host's data disk.
+Admission counts that copy on top of the room the box needs to grow, and the data disk would go below its
+floor. Like any disk refusal it waits with `--wait` first, then fails with exit 8.
+
+**Fix.** Make room on the host's data disk, as for [Host disk low](#host-disk-low): `davit box rm` boxes you
+no longer need, or `davit box gc`. Stopping boxes frees no disk; while the disk is low, the host itself moves
+other stopped boxes to cold storage. Then run `davit box up` again, or queue longer with `--wait 10m`.
+
+## A box never goes cold
+
+`davit box ls` shows it `hot` long after it stopped. That is expected when:
+
+- it is **pinned hot** (`pinned hot` in `box ls`; `davit box unpin` clears it). A plain `pinned` box still
+  goes cold;
+- it holds **little data of its own**: less than `coldStorage.minBytes` (512 MiB by default) beyond its image.
+  Moving it would free almost nothing;
+- it is **running**, starting or stopping, or has an open session, stream, tunnel or prompt, or a request is
+  queued for it. A project image's builder never moves either;
+- it was **used recently**: within `coldStorage.after` (6 hours by default). Any change to the box (its stop, a
+  pin or unpin) counts as use, and after a daemon restart a box counts from its last change;
+- the **host is busy**: moves wait while a VM starts or stops, a request queues for capacity, or I/O pressure
+  is above `coldStorage.ioBusyPercent`;
+- the cold disk is **full** or the tier is **draining** (`box ls` says `draining` or `LOW`);
+- another VM boots from its disk (a snapshot or fork made from it).
+
+The daemon's log (`journalctl --user -u davit -g 'cold storage'`) names a failed move, and at debug level why
+a box stays hot ([storage-tiers.md](storage-tiers.md#monitoring)).

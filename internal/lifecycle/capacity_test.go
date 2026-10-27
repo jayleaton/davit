@@ -109,7 +109,7 @@ func TestMemoryFloorDisabledAndUnsupported(t *testing.T) {
 func TestCapacityReport(t *testing.T) {
 	e := newEnv(t, fake.Options{}, func(c *Config) {
 		c.FreeMemory = func() (int64, error) { return 64 * domain.GiB, nil }
-		c.FreeSpace = func() (int64, error) { return 500 * domain.GiB, nil }
+		c.DiskSpace = func() (domain.DiskUsage, error) { return domain.DiskUsage{FreeBytes: 500 * domain.GiB}, nil }
 		c.Limits = domain.Limits{CPUs: 9, VMs: 10, MinFreeMemoryBytes: domain.GiB}
 	})
 	ctx := context.Background()

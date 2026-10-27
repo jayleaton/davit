@@ -63,7 +63,7 @@ func (s *Service) Recover(ctx context.Context, req Request, ref string, body api
 		// A ready or running VM already holds its CPUs and memory, and its
 		// VMM is gone before the new one starts; an error VM holds none.
 		if !vm.State.Live() {
-			if err := s.admit(tx, domain.Shape{CPUs: vm.Shape.CPUs, MemoryBytes: vm.Shape.MemoryBytes}); err != nil {
+			if err := s.admit(tx, domain.Shape{CPUs: vm.Shape.CPUs, MemoryBytes: vm.Shape.MemoryBytes}, vm.Shape); err != nil {
 				return nil, err
 			}
 		}

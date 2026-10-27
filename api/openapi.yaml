@@ -301,6 +301,43 @@ paths:
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
 
+  /images/prune:
+    post:
+      operationId: pruneImages
+      tags: [images]
+      summary: "Remove the host's image blobs that no image uses (host owner only)."
+      description: |
+        `davit box image prune`. Removes files of the daemon's blob store
+        (`<dataDir>/images/blobs/sha256/<hex>`) that davit can prove unused:
+        no manifest in `<dataDir>/images/manifests` or in the config names
+        their digest (anywhere in the manifest), no image the daemon serves
+        uses them, and they have not changed for an hour (an install moves
+        blobs in before their manifest). A manifest that cannot be read stops
+        the prune. Goldens captured from a removed blob are swept. The
+        low-disk cleanup runs the same prune. `dryRun` only lists them.
+      x-davit-implemented: true
+      parameters:
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PruneImagesRequest'}
+      responses:
+        '200':
+          description: The blobs removed (or, with dryRun, that would be).
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PruneImagesResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/PermissionDenied'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
   /vms/{vmId}:
     parameters:
       - $ref: '#/components/parameters/VMId'
@@ -364,6 +401,9 @@ paths:
         call fails (503, retryable) and the previous policy stays in force.
         A request with `egress` is rejected with `409 operation_in_progress`
         while a lifecycle operation is running.
+
+        `keep` pins the VM against the low-disk auto-delete; `keepHot` keeps
+        it off the host's cold storage tier (docs/storage-tiers.md).
       x-davit-implemented: true
       parameters:
         - $ref: '#/components/parameters/IfMatch'
@@ -3599,6 +3639,14 @@ components:
     Arch:
       type: string
       enum: [amd64, arm64]
+    StorageTier:
+      type: string
+      description: >-
+        Storage tier holding a VM's committed disk (docs/storage-tiers.md): `hot` is the data
+        dir's filesystem, `cold` the optional slower, larger one stopped VMs move to when unused.
+        VM.tier is `cold` once the host moved the stopped VM there, so the next resume copies it
+        back first (VM.coldBytes); absent means hot.
+      enum: [hot, cold]
     ErrorCode:
       type: string
       description: |
@@ -3721,6 +3769,34 @@ components:
           type: integer
           format: int64
           description: Free space of the data dir.
+        totalDiskBytes:
+          type: integer
+          format: int64
+          description: Size of the data dir's filesystem; absent where not measured.
+        diskFloorBytes:
+          type: integer
+          format: int64
+          description: >-
+            Free-space floor admission keeps: the larger of `limits.minFreeDiskBytes` and
+            `limits.minFreeDiskPercent` of the filesystem. Below it new, fork and resume are refused
+            or queued and the low-disk cleanup runs. Absent when disabled or not measured.
+        diskReservedBytes:
+          type: integer
+          format: int64
+          description: Growth headroom reserved for VMs still provisioning, counted as used by admission.
+        diskHeadroomBytes:
+          type: integer
+          format: int64
+          description: >-
+            Free space admission reserves for a VM of the default shape to grow into
+            (`limits.diskHeadroomPercent` of its disk size).
+        saveReserveBytes:
+          type: integer
+          format: int64
+          description: Space set aside so that stopping (committing) a running VM never fails for lack of space.
+        saveReserveArmed:
+          type: boolean
+          description: False while a stop is using the save reserve (or it could not be set aside).
         allocated: {$ref: '#/components/schemas/Shape'}
         limits: {$ref: '#/components/schemas/Limits'}
         liveVms:
@@ -3746,6 +3822,60 @@ components:
           type: array
           description: Requests queued for capacity (`waitSeconds`), first in line first.
           items: {$ref: '#/components/schemas/CapacityWaiter'}
+        cold: {$ref: '#/components/schemas/ColdCapacity'}
+    ColdCapacity:
+      type: object
+      description: >-
+        The cold storage tier (docs/storage-tiers.md): the filesystem stopped VMs unused for
+        `afterSeconds` move to. Absent from HostCapacity when none is configured and no VM is on one.
+      required: [freeBytes, afterSeconds, vms, bytes, fastClone]
+      properties:
+        freeBytes:
+          type: integer
+          format: int64
+          description: Free space of the cold filesystem.
+        totalBytes:
+          type: integer
+          format: int64
+          description: Size of the cold filesystem; absent where not measured.
+        floorBytes:
+          type: integer
+          format: int64
+          description: >-
+            Free space moving VMs to cold storage keeps there (`coldStorage.minFreeBytes` /
+            `minFreePercent` of its size).
+        afterSeconds:
+          type: integer
+          format: int64
+          description: How long a stopped VM must be unused before the host moves it to cold storage.
+        vms:
+          type: integer
+          description: VMs on cold storage.
+        bytes:
+          type: integer
+          format: int64
+          description: Data of the VMs on cold storage.
+        fastClone:
+          type: boolean
+          description: Whether the cold filesystem supports reflink copies.
+        detail:
+          type: string
+          description: The reflink probe's detail.
+        sameFilesystem:
+          type: boolean
+          description: >-
+            True when the cold directory is on the data dir's own filesystem: moving VMs there frees
+            nothing.
+        draining:
+          type: boolean
+          description: >-
+            True while the tier is being emptied (`coldStorage.drain`): nothing moves there and cold
+            VMs come back.
+        unavailable:
+          type: string
+          description: >-
+            Why the cold tier is not in use although VMs are on it (its disk is missing, or it is no
+            longer configured); they cannot resume until it is back.
     CapacityWaiter:
       type: object
       required: [ticket, memoryBytes, since]
@@ -3759,6 +3889,17 @@ components:
           type: integer
           format: int64
           description: Memory the request needs (0 if not known).
+        resource:
+          type: string
+          description: >-
+            What the request's last refusal was for: `memory`, `vms`, `cpu` or `disk` (free space);
+            absent before it was refused.
+        diskBytes:
+          type: integer
+          format: int64
+          description: >-
+            Free space it needs (its growth headroom, the headroom reserved for VMs starting, and
+            the floor) when it waits for disk space.
         since:
           type: string
           format: date-time
@@ -3773,7 +3914,25 @@ components:
         minFreeDiskBytes:
           type: integer
           format: int64
-          description: Free-space floor of the data dir (0 = default, negative = disabled).
+          description: >-
+            Free-space floor of the data dir, at least this many bytes (0 = default 5 GiB, negative =
+            no floor: disk admission and the low-disk cleanup off).
+        minFreeDiskPercent:
+          type: integer
+          description: >-
+            Free-space floor as a share of the filesystem; the floor is the larger of the two (0 =
+            default 10, negative = bytes only).
+        diskHeadroomPercent:
+          type: integer
+          description: >-
+            Share of a VM's disk size admission reserves for its private growth (0 = default 25,
+            negative = none).
+        saveReserveBytes:
+          type: integer
+          format: int64
+          description: >-
+            Space set aside (a reserve file) that only stops may use (0 = default 2 GiB, negative =
+            none).
         vms:
           type: integer
           description: Live VMs at once (0 = unlimited).
@@ -4087,6 +4246,30 @@ components:
           description: >-
             Stops the VM (keeping its disk) after this long with no exec, attached process stream or
             tunnel (ssh) activity. Absent or 0: never. Independent of the TTL.
+        keep:
+          type: boolean
+          description: >-
+            Pinned (`davit box pin`): never auto-deleted by the host's low-disk cleanup. On a project
+            image's builder VM it pins the image. Moving to cold storage is separate (`keepHot`).
+        keepHot:
+          type: boolean
+          description: >-
+            Kept on hot storage (`davit box pin --hot`): the host never moves the VM to its cold
+            storage tier (docs/storage-tiers.md).
+        tier: {$ref: '#/components/schemas/StorageTier'}
+        coldBytes:
+          type: integer
+          format: int64
+          description: The data a resume of a cold VM copies back to hot storage.
+        coldAt:
+          type: string
+          format: date-time
+          description: When the VM went cold.
+        deleteReason:
+          type: string
+          description: >-
+            On a deleted VM the host deleted on its own (the low-disk cleanup's auto-delete): why,
+            with how long it was unused and the disk's state. Absent when its owner deleted it.
         lastActivityAt:
           type: string
           format: date-time
@@ -4193,6 +4376,9 @@ components:
           minimum: 0
           maximum: 2592000
           description: Stop the VM after this long without activity (see VM.idleTimeoutSeconds).
+        keep:
+          type: boolean
+          description: Pin the VM (see VM.keep).
       not:
         required: [image, snapshotId]
     ForkVMRequest:
@@ -4253,6 +4439,14 @@ components:
           minimum: 0
           maximum: 2592000
           description: Replaces the idle timeout (0 disables it); the countdown restarts now.
+        keep:
+          type: boolean
+          description: Pins (true) or unpins the VM (see VM.keep).
+        keepHot:
+          type: boolean
+          description: >-
+            True keeps the VM on hot storage (never moved to cold storage); false lets it go cold
+            again (see VM.keepHot).
     StopVMRequest:
       type: object
       properties:
@@ -4326,6 +4520,72 @@ components:
         operationId:
           type: string
           description: The stop (absent with dryRun).
+    PruneImagesRequest:
+      type: object
+      properties:
+        dryRun:
+          type: boolean
+          description: List what would be removed without removing it.
+    PruneImagesResult:
+      type: object
+      required: [dryRun, removed, kept, bytes]
+      properties:
+        dryRun:
+          type: boolean
+        removed:
+          type: array
+          description: The removed (or removable) blobs, least recently changed first.
+          items: {$ref: '#/components/schemas/PrunedBlob'}
+        kept:
+          type: integer
+          description: Blobs that stay (referenced, or changed within the last hour).
+        bytes:
+          type: integer
+          format: int64
+          description: Space the removed blobs took on disk.
+    PrunedBlob:
+      type: object
+      required: [digest, bytes, changedAt]
+      properties:
+        digest:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        changedAt:
+          type: string
+          format: date-time
+    AutoDeletion:
+      type: object
+      description: >-
+        The data of a `vm.autodeleted` event: an unused box the host's low-disk cleanup deleted.
+      required: [vmId, name, box, kind, lastUsedAt, unusedSeconds, freedBytes, deletedAt, reason]
+      properties:
+        vmId:
+          type: string
+        name:
+          type: string
+        box:
+          type: string
+          description: PROJECT/INSTANCE, or PROJECT for a project image.
+        kind:
+          type: string
+          description: "`image` or `instance`."
+        lastUsedAt:
+          type: string
+          format: date-time
+        unusedSeconds:
+          type: integer
+          format: int64
+        freedBytes:
+          type: integer
+          format: int64
+          description: Free space the deletion gave back as measured (data shared with other boxes stays).
+        deletedAt:
+          type: string
+          format: date-time
+        reason:
+          type: string
     CreateVMsResult:
       type: object
       required: [items]
@@ -5191,7 +5451,7 @@ components:
       description: |
         One entry of the host event stream, in seq order. Types: vm.created, vm.state,
         operation.created, operation.state, operation.progress, run.created, run.state,
-        prompt.created, prompt.state, golden.evicted; tolerate unknown types. data is an allowlisted summary
+        prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion); tolerate unknown types. data is an allowlisted summary
         (IDs, states, error codes): never environment values, prompt text or secrets.
       required: [seq, type, time, subject, data]
       properties:

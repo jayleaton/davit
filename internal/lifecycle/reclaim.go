@@ -16,7 +16,7 @@ import (
 
 // Making room for a VM (feature capacityReclaim). When admission refuses a
 // create, fork or resume for memory, the live VM count or CPU
-// (domain.IsRoomError; disk never), the host first stops idle VMs, oldest
+// (domain.IsRoomError, but not disk space), the host first stops idle VMs, oldest
 // activity first, and retries after each stop. A VM is reclaimable when it
 // has an idle timeout (it agreed to be stopped when unused), is ready with
 // no operation, runs no process, has no stream or tunnel open, holds no
@@ -24,6 +24,11 @@ import (
 // Ephemeral and no-snapshot VMs are never reclaimed: their stop would lose
 // the disk. Each reclaim is a stop with Operation.reason "reclaim", logged
 // and visible as operation.created in the event stream.
+//
+// A refusal for disk space (domain.IsDiskSpaceError) stops no VM at once:
+// stopping frees no space. It queues like the others, and the head of the
+// queue runs the low-disk cleanup for what it needs (diskclean.go) before
+// each retry.
 //
 // If there is still no room, a request with a capacity wait (createVM and
 // resumeVM waitSeconds) joins a FIFO queue. Only the head retries admission
@@ -39,7 +44,14 @@ const waitPoll = 500 * time.Millisecond
 // maxReclaims bounds the VMs stopped for one admission attempt.
 const maxReclaims = 32
 
-type waiter struct{ domain.CapacityWaiter }
+type waiter struct {
+	domain.CapacityWaiter
+	// principal and ref name the VM a queued resume boots, and snapshot the
+	// snapshot a queued create boots, which the low-disk cleanup never
+	// deletes.
+	principal     domain.PrincipalID
+	ref, snapshot string
+}
 
 // withRoom runs try (an admission) and makes room or waits up to wait as
 // described above.
@@ -78,6 +90,9 @@ func (s *Service) withRoom(ctx context.Context, req Request, wait time.Duration,
 		if s.queuePos(w) > 0 {
 			continue
 		}
+		if domain.IsDiskSpaceError(last) {
+			s.freeDisk(ctx, diskNeed(last), req.Principal)
+		}
 		acc, err := s.reclaimFor(ctx, try)
 		if !domain.IsRoomError(err) {
 			if err == nil {
@@ -86,7 +101,19 @@ func (s *Service) withRoom(ctx context.Context, req Request, wait time.Duration,
 			return acc, err
 		}
 		last = err
+		s.setNeed(w, last)
 	}
+}
+
+// diskNeed is the free space a disk refusal says the request needs (its
+// headroom, the headroom reserved for VMs starting, and the floor).
+func diskNeed(err error) int64 {
+	if e, ok := err.(*domain.Error); ok && e != nil {
+		if n, ok := e.Details["needBytes"].(int64); ok {
+			return n
+		}
+	}
+	return 0
 }
 
 // waitedOut is the refusal after a capacity wait ran out.
@@ -115,11 +142,56 @@ func (s *Service) enqueue(req Request, last error) *waiter {
 		_, _ = rand.Read(b)
 		key = hex.EncodeToString(b)
 	}
-	w := &waiter{domain.CapacityWaiter{Ticket: domain.CapacityTicket(key), MemoryBytes: vmMemory(last), Since: s.now()}}
+	w := &waiter{CapacityWaiter: domain.CapacityWaiter{Ticket: domain.CapacityTicket(key), Since: s.now()},
+		principal: req.Principal, ref: req.VMRef, snapshot: req.CapacitySnapshot}
 	s.mu.Lock()
 	s.queue = append(s.queue, w)
 	s.mu.Unlock()
+	s.setNeed(w, last)
 	return w
+}
+
+// setNeed records what w's last refusal says it is waiting for.
+func (s *Service) setNeed(w *waiter, last error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.MemoryBytes = vmMemory(last)
+	w.Resource, w.DiskBytes = "", 0
+	if e, ok := last.(*domain.Error); ok && e != nil {
+		w.Resource, _ = e.Details["resource"].(string)
+		if domain.IsDiskSpaceError(e) {
+			w.DiskBytes = diskNeed(e)
+		}
+	}
+}
+
+// queued is what queued requests boot: VM and snapshot references (ID or
+// name), by owner.
+type queued struct {
+	vms, snapshots map[domain.PrincipalID][]string
+}
+
+func (q queued) vm(v domain.VM) bool {
+	return slices.Contains(q.vms[v.Owner], string(v.ID)) || slices.Contains(q.vms[v.Owner], v.Name)
+}
+
+func (q queued) snapshot(sn *domain.Snapshot) bool {
+	return slices.Contains(q.snapshots[sn.Owner], string(sn.ID)) || sn.Name != "" && slices.Contains(q.snapshots[sn.Owner], sn.Name)
+}
+
+func (s *Service) queuedRefs() queued {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := queued{map[domain.PrincipalID][]string{}, map[domain.PrincipalID][]string{}}
+	for _, w := range s.queue {
+		if w.ref != "" {
+			q.vms[w.principal] = append(q.vms[w.principal], w.ref)
+		}
+		if w.snapshot != "" {
+			q.snapshots[w.principal] = append(q.snapshots[w.principal], w.snapshot)
+		}
+	}
+	return q
 }
 
 func (s *Service) dequeue(w *waiter) {
@@ -169,13 +241,13 @@ func vmMemory(err error) int64 {
 // so two of them never stop two VMs for one shortfall.
 func (s *Service) reclaimFor(ctx context.Context, try func() (*Accepted, error)) (*Accepted, error) {
 	acc, err := try()
-	if !domain.IsRoomError(err) || s.cfg.Limits.ReclaimIdleAfter() == 0 {
-		return acc, err
+	if !domain.IsRoomError(err) || domain.IsDiskSpaceError(err) || s.cfg.Limits.ReclaimIdleAfter() == 0 {
+		return acc, err // stopping VMs frees no disk space (freeDisk does)
 	}
 	s.reclaimMu.Lock()
 	defer s.reclaimMu.Unlock()
 	acc, err = try() // another admission may have made room meanwhile
-	for n := 0; domain.IsRoomError(err) && n < maxReclaims; n++ {
+	for n := 0; domain.IsRoomError(err) && !domain.IsDiskSpaceError(err) && n < maxReclaims; n++ {
 		vms, rerr := s.reclaimable(ctx, reclaimQuery{idle: s.cfg.Limits.ReclaimIdleAfter(), needTimeout: true})
 		if rerr != nil {
 			s.cfg.Log.Warn("reclaim: list idle VMs", "err", rerr)

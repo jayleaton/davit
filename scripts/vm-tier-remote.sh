@@ -5,8 +5,10 @@
 #   vm-tier-remote.sh check                      host requirements (exit 2 if unmet)
 #   vm-tier-remote.sh prepare RUN                toolchain + fixture, once (blobs already unpacked)
 #   vm-tier-remote.sh images RUN REBUILD [IMAGE...]  build images here (default ubuntu-24.04-base)
-#   vm-tier-remote.sh run RUN REGEX BENCH TIMEOUT FRESH PKGS...
+#   vm-tier-remote.sh run RUN REGEX BENCH TIMEOUT FRESH SMALL_FS COLD_FS PKGS...
 #                                                sync, then the real-VM tier, serially
+#                                                (SMALL_FS: DAVIT_TEST_SMALL_FS, COLD_FS:
+#                                                DAVIT_TEST_COLD_FS; each or -)
 #   vm-tier-remote.sh cleanup RUN                kill the run's processes, remove its files
 #
 # Host layout (SVM_DIR, default ~/.svm: short, unix socket paths are limited
@@ -188,7 +190,11 @@ cleanup() {
 	if [ -f "$dir/pgid" ] && p=$(cat "$dir/pgid") && [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$SRC" ]; then
 		kill -KILL -- "-$p" 2>/dev/null || true
 	fi
-	local paths=("$dir/" "$SCRATCH/e2e-" "$SCRATCH/disk-" "$SCRATCH/agent/")
+	local paths=("$dir/" "$SCRATCH/e2e-" "$SCRATCH/disk-" "$SCRATCH/agent/") small="" cold=""
+	# The disk-low and cold-tier tests' directories on the small filesystem
+	# (--small-fs) and the cold one (--cold-fs).
+	[ -f "$dir/small-fs" ] && small=$(cat "$dir/small-fs") && paths+=("$small/davit-disklow-" "$small/davit-cold-")
+	[ -f "$dir/cold-fs" ] && cold=$(cat "$dir/cold-fs") && paths+=("$cold/davit-cold-")
 	for round in 1 2 3; do
 		mapfile -t pids < <(procs_under "${paths[@]}")
 		[ ${#pids[@]} -gt 0 ] || break
@@ -203,6 +209,8 @@ cleanup() {
 	# Leftover per-run scratch (test disks, e2e data dirs); the fixture's
 	# bin/ and images/ persist across runs.
 	find "$SCRATCH" -mindepth 1 -maxdepth 1 ! -name bin ! -name images -exec rm -rf {} + 2>/dev/null || true
+	[ -z "$small" ] || find "$small" -mindepth 1 -maxdepth 1 \( -name 'davit-disklow-*' -o -name 'davit-cold-*' \) -exec rm -rf {} + 2>/dev/null || true
+	[ -z "$cold" ] || find "$cold" -mindepth 1 -maxdepth 1 -name 'davit-cold-*' -exec rm -rf {} + 2>/dev/null || true
 	rm -rf "$dir/t"
 	# keep-out: the caller still fetches out/ and then calls cleanup again.
 	[ "${2:-}" = keep-out ] || rm -rf "$dir"
@@ -210,8 +218,8 @@ cleanup() {
 }
 
 run_tier() {
-	local run=$1 re=$2 bench=$3 timeout=$4 fresh=$5
-	shift 5
+	local run=$1 re=$2 bench=$3 timeout=$4 fresh=$5 small=$6 cold=$7
+	shift 7
 	local dir=$SVM_DIR/runs/$run rc=0 start
 	lock
 	mkdir -p "$dir/out" "$dir/t"
@@ -226,10 +234,22 @@ run_tier() {
 		echo "commit $(cat "$dir/payload/HEAD")$([ -s "$dir/payload/changes.patch" ] || [ -s "$dir/payload/untracked.tar" ] && echo ' + local changes')"
 		echo "go test -p 1 -count=1 -timeout $timeout -run '$re' $*"
 		[ "$bench" = 1 ] && echo "DAVIT_BENCH=1"
+		[ "$small" = - ] || echo "DAVIT_TEST_SMALL_FS=$small ($(df -h --output=fstype,size,avail "$small" | tail -1))"
+		[ "$cold" = - ] || echo "DAVIT_TEST_COLD_FS=$cold ($(df -h --output=fstype,size,avail "$cold" | tail -1))"
 		"$MISE" exec -- go version
 		nproc; free -g; uptime
 	} >"$dir/out/run.txt"
 	export TMPDIR=$dir/t
+	if [ "$small" != - ]; then
+		[ -d "$small" ] || die "--small-fs $small: no such directory"
+		echo "$small" >"$dir/small-fs"
+		export DAVIT_TEST_SMALL_FS=$small
+	fi
+	if [ "$cold" != - ]; then
+		[ -d "$cold" ] || die "--cold-fs $cold: no such directory"
+		echo "$cold" >"$dir/cold-fs"
+		export DAVIT_TEST_COLD_FS=$cold
+	fi
 	[ "$bench" = 1 ] && export DAVIT_BENCH=1
 	start=$(date '+%Y-%m-%d %H:%M:%S')
 	say "real-VM tier: -run '$re' $* (serial: one package, one test at a time)"
@@ -337,7 +357,7 @@ case "$cmd" in
 check) check ;;
 prepare) [ $# -eq 1 ] || die "prepare RUN"; prepare "$1" ;;
 images) [ $# -ge 2 ] || die "images RUN REBUILD [IMAGE...]"; images "$@" ;;
-run) [ $# -ge 6 ] || die "run RUN REGEX BENCH TIMEOUT FRESH PKGS..."; run_tier "$@" ;;
+run) [ $# -ge 8 ] || die "run RUN REGEX BENCH TIMEOUT FRESH SMALL_FS COLD_FS PKGS..."; run_tier "$@" ;;
 cleanup) [ $# -eq 1 ] || die "cleanup RUN"; cleanup "$1" ;;
 *) die "unknown command $cmd" ;;
 esac

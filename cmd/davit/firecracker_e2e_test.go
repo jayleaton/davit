@@ -42,8 +42,17 @@ type fcHost struct {
 }
 
 func newFCHost(t *testing.T, edit func(*config.Daemon)) *fcHost {
+	return newFCHostIn(t, "", edit)
+}
+
+// newFCHostIn is newFCHost with the daemon's data dir in parent (default
+// the fixture scratch).
+func newFCHostIn(t *testing.T, parent string, edit func(*config.Daemon)) *fcHost {
 	fx := fctest.Setup(t)
-	data, err := os.MkdirTemp(fx.Scratch, "e2e-")
+	if parent == "" {
+		parent = fx.Scratch
+	}
+	data, err := os.MkdirTemp(parent, "e2e-")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -175,13 +175,18 @@ func TestClassifyResources(t *testing.T) {
 	if c := ClassifyMemory(m, 64*domain.GiB); c.Status != Warn {
 		t.Fatalf("limit above RAM: %+v", c)
 	}
-	if s, _, _ := ClassifyDiskSpace(50*domain.GiB, 100*domain.GiB, 0); s != Warn {
+	fs := func(free, total int64) domain.DiskUsage { return domain.DiskUsage{FreeBytes: free, TotalBytes: total} }
+	if s, _, _ := ClassifyDiskSpace(fs(50*domain.GiB, 0), domain.Limits{DiskBytes: 100 * domain.GiB, MinFreeDiskBytes: -1}); s != Warn {
 		t.Fatal("free below limit must warn")
 	}
-	if s, _, _ := ClassifyDiskSpace(50*domain.GiB, 0, domain.GiB); s != Pass {
+	if s, _, _ := ClassifyDiskSpace(fs(50*domain.GiB, 200*domain.GiB), domain.Limits{}); s != Pass {
 		t.Fatal("plenty of space")
 	}
-	if s, _, h := ClassifyDiskSpace(500*domain.MiB, 0, domain.GiB); s != Fail || h == "" {
+	// The default floor on a 200 GiB disk is 20 GiB (10%).
+	if s, d, h := ClassifyDiskSpace(fs(30*domain.GiB, 200*domain.GiB), domain.Limits{}); s != Warn || h == "" || !strings.Contains(d, "floor 20.0GiB") {
+		t.Fatalf("free space below twice the floor must warn: %s %q", s, d)
+	}
+	if s, _, h := ClassifyDiskSpace(fs(500*domain.MiB, 200*domain.GiB), domain.Limits{}); s != Fail || h == "" {
 		t.Fatal("free space below the admission floor must fail with a hint")
 	}
 }
@@ -325,8 +330,12 @@ func TestEveryProblemHasAFix(t *testing.T) {
 		checks = append(checks, ClassifyMemory(m, 0))
 	}
 	checks = append(checks, ClassifyMemory(MemFacts{Total: domain.GiB, Available: domain.GiB}, 2*domain.GiB))
-	for _, d := range [][3]int64{{domain.MiB, 0, domain.GiB}, {20 * domain.GiB, 50 * domain.GiB, 0}, {domain.GiB, 0, 0}} {
-		s, detail, hint := ClassifyDiskSpace(d[0], d[1], d[2])
+	for _, d := range []struct {
+		free, total int64
+		l           domain.Limits
+	}{{domain.MiB, 0, domain.Limits{}}, {20 * domain.GiB, 0, domain.Limits{DiskBytes: 50 * domain.GiB, MinFreeDiskBytes: -1}},
+		{domain.GiB, 0, domain.Limits{MinFreeDiskBytes: -1}}, {7 * domain.GiB, 0, domain.Limits{}}} {
+		s, detail, hint := ClassifyDiskSpace(domain.DiskUsage{FreeBytes: d.free, TotalBytes: d.total}, d.l)
 		checks = append(checks, Check{ID: "disk_space", Status: s, Detail: detail, Hint: hint})
 	}
 	dir := t.TempDir()
@@ -402,5 +411,16 @@ func TestImagesCheck(t *testing.T) {
 	}
 	if c := imagesCheck(Options{Runtime: "fake"}); c.Status != Skip {
 		t.Fatalf("fake runtime: %+v", c)
+	}
+}
+
+func TestIOPressure(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "io")
+	os.WriteFile(p, []byte("some avg10=31.50 avg60=4.00 avg300=1.00 total=123\nfull avg10=2.00 avg60=0.00 avg300=0.00 total=9\n"), 0o600)
+	if v, ok := ioPressure(p); !ok || v != 31.5 {
+		t.Fatalf("ioPressure = %v %v", v, ok)
+	}
+	if _, ok := ioPressure(filepath.Join(t.TempDir(), "missing")); ok {
+		t.Fatal("a missing PSI file reads as a value")
 	}
 }
