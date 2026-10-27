@@ -179,12 +179,22 @@ func RunWith(ctx context.Context, cfg config.Daemon, log *slog.Logger, opts Opti
 	if guest {
 		workspace = late
 	}
+	// Simulated VMs write no disks, so the disk guard (admission against the
+	// floor, the save reserve, the low-disk cleanup) measures only a real
+	// runtime's data dir: a development or CI machine short on space still
+	// runs fake VMs.
+	var diskSpace func() (domain.DiskUsage, error)
+	var reserve lifecycle.SaveReserve
+	if !fakeRuntime {
+		diskSpace = func() (domain.DiskUsage, error) { return preflight.DiskSpace(cfg.DataDir) }
+		reserve = saveReserve(cfg)
+	}
 	svc, err = lifecycle.New(lifecycle.Config{
 		HostOwner: httpapi.LocalPrincipal(os.Getuid()),
 		DB:        db, Runtime: rt, Storage: store, Images: images, Prober: prober, Network: netProv, OnDeleted: onDeleted,
 		Identity: identity,
-		Limits:   cfg.Limits, DiskSpace: func() (domain.DiskUsage, error) { return preflight.DiskSpace(cfg.DataDir) },
-		SaveReserve: saveReserve(cfg), SyncDisk: func() error { return preflight.SyncFS(cfg.DataDir) },
+		Limits:   cfg.Limits, DiskSpace: diskSpace,
+		SaveReserve: reserve, SyncDisk: func() error { return preflight.SyncFS(cfg.DataDir) },
 		AutoDelete: autoDeletePolicy(cfg.AutoDelete), ImageBlobs: imageBlobs(cfg), Cold: cold, ColdUnavailable: coldErr,
 		FreeMemory: preflight.FreeMemory, DefaultTTL: time.Duration(cfg.DefaultTTL), StopGrace: time.Duration(cfg.StopGrace),
 		StopAttempts: cfg.StopAttempts, NoStopForce: cfg.StopForceAfterRetries != nil && !*cfg.StopForceAfterRetries,

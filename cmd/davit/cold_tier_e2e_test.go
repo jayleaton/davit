@@ -15,7 +15,8 @@ import (
 )
 
 // TestColdTierEndToEnd drives the cold storage tier through the CLI on
-// the fake runtime (coldStorage after 1s, any size, never I/O-busy): a
+// the fake runtime (coldStorage after 1s, any size, no free-space floor on
+// a test machine's disk, never I/O-busy): a
 // stopped box goes cold at a sweep while a running one, one pinned --hot
 // and the project image's builder stay hot; a daemon kill and restart keep the cold box cold with
 // its commit only on the cold tier; box up says it restores, the resume
@@ -28,7 +29,7 @@ func TestColdTierEndToEnd(t *testing.T) {
 	if err := os.MkdirAll(cold, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h.extraConfig = fmt.Sprintf(`"coldStorage":{"dir":%q,"after":"1s","minBytes":-1,"ioBusyPercent":-1}`, cold)
+	h.extraConfig = fmt.Sprintf(`"coldStorage":{"dir":%q,"after":"1s","minBytes":-1,"minFreeBytes":-1,"ioBusyPercent":-1}`, cold)
 	h.start(0, 0)
 	data := filepath.Join(h.dir, "data")
 	// The fake guest runs commands on this host: the box work dir is a
