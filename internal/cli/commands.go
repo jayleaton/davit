@@ -127,6 +127,9 @@ func commands() map[string]cmd {
 		{name: "desktop", usage: "open|url|close [ID] [--port N] [--browser]", flags: desktopFlags, run: runDesktop},
 		{name: "expose", usage: "[ID] PORT [--name NAME] [--forward-identity]", flags: exposeFlags, run: runExpose},
 		{name: "endpoints", usage: "[ID] | hide|show|delete [ID] NAME | rename [ID] NAME NEW", run: runEndpoints},
+		{name: "ci", usage: ciUsage, flags: func(fs *flag.FlagSet, o *opts) {
+			fs.IntVar(&o.limit, "limit", 0, "recent jobs to show (default 20, max 200)")
+		}, run: runCI},
 		{name: "events", usage: "[--follow] [--types T,..] [--vm VM] [--start oldest|latest]", flags: eventsFlags, run: runEvents},
 		{name: "webhook", usage: "create URL [--event T]... | list | show ID | update ID ... | delete ID | rotate ID | deliveries ID | retry ID DELIVERY", flags: webhookFlags, run: runWebhook},
 		{name: "whoami", usage: "", run: runWhoami},

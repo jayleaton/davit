@@ -10,6 +10,7 @@ manifests. This page covers what is installed in each image and how a project ge
 | `ubuntu-24.04-base` | systemd, sshd, the guest agent, git, build-essential, python3, curl, Docker CE (dockerd starts at boot) | the smallest bootable box |
 | `ubuntu-24.04-dev` | base, plus Go (the version `mise.toml` pins), Node.js LTS with npm/npx/corepack, pnpm (standalone), uv/uvx, mise, and `pkg-config`, `libssl-dev`, `zlib1g-dev`, `libffi-dev`, `python3-venv`, `python3-dev`, `jq`, `ripgrep`, `sqlite3`, `zip`/`unzip` | the default for project boxes (`make host-install` makes it the first image) |
 | `ubuntu-24.04-harness` | base, plus Node.js and the Claude Code and Codex CLIs | prompt harnesses |
+| `ubuntu-24.04-ci` | dev, plus the GitHub Actions runner for a user `runner`, `python3-pip` and the runner's .NET libraries | GitHub Actions jobs ([below](#ubuntu-2404-ci-github-actions-runners)) |
 
 In `ubuntu-24.04-dev`:
 - **Versions.** Every toolchain is pinned by version and sha256 in `images/inputs.lock`, and its layer checks
@@ -24,6 +25,44 @@ In `ubuntu-24.04-dev`:
   on first use and kept on the box's disk.
 - **Docker.** Docker is the in-guest `dockerd`, already running at boot. The image user is in the `docker`
   group, and nothing is rootless.
+
+## ubuntu-24.04-ci: GitHub Actions runners
+
+`ubuntu-24.04-ci` is `ubuntu-24.04-dev` plus the [GitHub Actions runner](https://github.com/actions/runner), so
+a job gets dev's toolchains, Docker and sudo:
+- **Runner.** The release pinned in `images/inputs.lock` (`ACTIONS_RUNNER_VERSION`, with the sha256 of each
+  tarball) is unpacked in `/opt/actions-runner`. The image registers nothing: it is started as
+  `/opt/actions-runner/run.sh` with a just-in-time config. The build checks that `config.sh --version` and
+  `run.sh --version`, run as `runner`, print the pinned version, which also proves the runner's .NET libraries
+  resolve.
+- **User.** Jobs run as `runner` (uid 1001, home `/home/runner`, group `docker`, passwordless sudo through
+  `/etc/sudoers.d/runner`), as on GitHub's hosted runners. The runner owns `/opt/actions-runner`, where it
+  writes `_diag` and `_work`.
+- **Tool cache.** `/opt/actions-runner/.env` sets `RUNNER_TOOL_CACHE` and `AGENT_TOOLSDIRECTORY` to
+  `/opt/hostedtoolcache` (owned by `runner`), `LANG=C.UTF-8` and `ImageOS=ubuntu24`. `actions/setup-node`,
+  `setup-go` and `setup-python` install there. `setup-python` picks its build from the OS version in
+  `lsb_release`/`/etc/os-release`.
+- **Updating the runner.** GitHub stops accepting a runner some time after a newer release, so the pin has to
+  follow actions/runner releases. Change `ACTIONS_RUNNER_VERSION` and both `ACTIONS_RUNNER_SHA256_*` in
+  `images/inputs.lock` (the release notes list each tarball's sha256), then rebuild the image
+  (`IMAGES=ubuntu-24.04-ci images/build.sh`). A runner that GitHub tells to update downloads the new release
+  into its own directory at run time; that copy is gone when the VM is.
+
+Compared with GitHub's `ubuntu-latest` (ubuntu-24.04) image, it does not include:
+- **Preinstalled language versions.** The tool cache starts empty. GitHub's image ships several Node.js,
+  Python, Go, Ruby and PyPy versions there; here each `setup-*` step downloads its version on first use. The
+  only languages already present are dev's (Go, Node.js LTS, Ubuntu's Python 3) on `PATH`.
+- **Other languages and SDKs.** No Java/JDKs, Maven, Gradle, .NET SDK, Ruby, PHP, Rust, Swift, Haskell,
+  Julia or R, and no Android SDK or NDK.
+- **Browsers and test tooling.** No Chrome, Chromium, Firefox, Edge, their drivers, or Xvfb.
+- **Databases and services.** No PostgreSQL, MySQL or MongoDB. Run them with Docker or job `services:`.
+- **Cloud and deployment CLIs.** No GitHub CLI (`gh`), AWS, Azure or Google Cloud CLIs, kubectl, Helm,
+  Terraform, Packer or Pulumi.
+- **Other utilities.** No Git LFS, Homebrew, Podman/Buildah/Skopeo, or the `apt` package lists: run
+  `sudo apt-get update` before installing a package.
+
+Docker CE with buildx and compose is there and `dockerd` starts at boot, so container actions, `services:`
+and `docker build` work.
 
 ## Caches: where a project image keeps its warm state
 
@@ -77,7 +116,7 @@ Pick the lightest option that works.
 
    | File | Required | What |
    |---|---|---|
-   | `base` | yes | the parent recipe, e.g. `ubuntu-24.04-base` (one level only) |
+   | `base` | yes | the parent recipe, e.g. `ubuntu-24.04-base`, or a derived one (`ubuntu-24.04-ci` names `ubuntu-24.04-dev`) |
    | `packages.txt` | no | extra Ubuntu packages, one per line, installed from the pinned snapshot |
    | `stage.sh` | no | host-side downloads into `$STAGE`, each through `fetch URL SHA256 DEST` with the pin in `inputs.lock` |
    | `layer.sh` | no | runs in the chroot before sealing; installs from `/.provision/layer/stage`; must not `apt-get` (the archive is live by then) |
@@ -87,7 +126,8 @@ Pick the lightest option that works.
    `ubuntu-24.04-dev` is the worked example: it has a `packages.txt`, a pinned `stage.sh` and a `layer.sh` that
    checks every version. To build it on a VM host and install it there, run
    `make host-install HOST=user@host HOST_INSTALL_FLAGS='--image <name> --image ubuntu-24.04-dev'`; the first
-   `--image` is the default. Only derive from `ubuntu-24.04-base`: the pipeline allows one level of parents.
+   `--image` is the default. A recipe may derive from a derived one: each parent's packages and layer go in
+   first, and the image keeps the parents' capabilities.
 
 Keep derived images lean. Everything in the rootfs is copied to every box's disk by reflink, so that costs
 nothing until it is written. But a cold boot reads what the guest touches, and golden snapshots capture memory

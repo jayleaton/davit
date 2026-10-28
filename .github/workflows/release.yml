@@ -4,7 +4,16 @@
 # (packaging/release.sh: host binaries, image bundles, install.sh, release.json,
 # SHA256SUMS) and publish it as a GitHub release (a prerelease when the tag
 # contains '-'). workflow_dispatch builds everything and uploads it as a
-# workflow artifact, but publishes nothing.
+# workflow artifact, but publishes nothing; so does a push to main that
+# changes images/, which also warms the image download cache below.
+#
+# Image download cache: the pinned Ubuntu snapshot's package indexes and .debs
+# (DAVIT_APT_CACHE, images/scripts/lib.sh) and the pinned downloads (kernel,
+# ubuntu-base, e2fsprogs) never change for one images/inputs.lock, so once a
+# build with those inputs succeeded, later builds need no mirror. A tag run can
+# restore only what the default branch saved, hence the push trigger on main.
+# The images are still built on every release: the guest agent is this
+# commit's davit binary.
 #
 # Trust policy (docs/install-host.md#trust): SHA256SUMS for integrity, GitHub
 # build-provenance attestations for authenticity. GitHub offers attestations
@@ -15,6 +24,9 @@ name: release
 on:
   push:
     tags: ['v*']
+    branches: [main]
+    # Not evaluated for tags: every v* tag runs.
+    paths: ['images/**', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -53,6 +65,7 @@ jobs:
             echo "DAVIT_IMAGES_WORK=$RUNNER_TEMP/images-work"
             echo "DAVIT_IMAGES_OUT=$RUNNER_TEMP/images-out"
             echo "DAVIT_MANIFESTS=$RUNNER_TEMP/manifests"
+            echo "DAVIT_APT_CACHE=$RUNNER_TEMP/apt-cache"
           } >>"$GITHUB_ENV"
 
       # Two sparse 4 GiB rootfs images, the kernel tree and the builder chroot
@@ -84,11 +97,34 @@ jobs:
           grep "^$user:" /etc/subuid /etc/subgid
           unshare --map-auto --map-root-user -- id
 
+      # Same snapshot (inputs.lock): reuse it even when packages.txt changed;
+      # apt fetches only what is missing.
+      - name: Restore the image download cache
+        id: dl-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ runner.temp }}/apt-cache
+            ${{ runner.temp }}/images-work/dl
+          key: images-dl-${{ hashFiles('images/inputs.lock') }}-${{ hashFiles('images/rootfs/*/packages.txt', 'images/scripts/builder.sh') }}
+          restore-keys: images-dl-${{ hashFiles('images/inputs.lock') }}-
+
       - name: Build guest images
+        id: images
         run: |
           JOBS=$(nproc) images/build.sh
           ls -lsh "$DAVIT_IMAGES_OUT/blobs/sha256" "$DAVIT_MANIFESTS"
+          du -sh "$DAVIT_APT_CACHE" "$DAVIT_IMAGES_WORK/dl"
           df -h /
+
+      - name: Save the image download cache
+        if: steps.images.outcome == 'success' && steps.dl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ runner.temp }}/apt-cache
+            ${{ runner.temp }}/images-work/dl
+          key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
       - name: make release
         id: release

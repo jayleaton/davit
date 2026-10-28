@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs inside the guest rootfs chroot (fake root in a user namespace), from build-rootfs.sh.
 # /.provision holds this directory plus docker.asc, modules-builtin.tar, the davit-guest-agent
-# binary and, for a derived image, its layer in /.provision/layer (layer.sh runs before sealing).
+# binary and, for a derived image, one layer per derived recipe in /.provision/layers/<n>-<recipe>,
+# root first (each layer.sh runs as /.provision/layer/layer.sh before sealing).
 # Env: everything from inputs.lock, DEB_ARCH, AGENT_VERSION.
 set -euxo pipefail
 umask 022
@@ -22,16 +23,35 @@ apt_get() {
   apt-get "$@"
 }
 
-apt_get update -q --error-on=any
+# With DAVIT_APT_CACHE (lib.sh) the indexes of these exact sources may already be here: the snapshot
+# never changes, so then there is nothing to update and no mirror to reach. The marker also covers
+# inputs.lock, because the Docker repository is not a snapshot and its pinned versions live there.
+apt_update() {
+  local m src=(/etc/apt/sources.list.d/*.sources)
+  [[ ! -f $P/apt-cache/inputs.lock ]] || src+=("$P/apt-cache/inputs.lock")
+  m=/var/lib/apt/davit-sources/$(cat "${src[@]}" | sha256sum | cut -c1-16)
+  if [[ -f $m ]]; then
+    echo "provision: apt indexes from the build's apt cache (sources ${m##*/})" >&2
+    return 0
+  fi
+  apt_get update -q --error-on=any
+  mkdir -p "${m%/*}"
+  : >"$m"
+}
+
+apt_update
 apt_get -y -q dist-upgrade
 mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$P/packages.txt")
 apt_get -y -q install "${pkgs[@]}"
-# A derived image's own packages.txt (same format), also from the pinned snapshot: its layer.sh
-# runs after the sources point at the live archive, so it must not apt-get itself.
-if [[ -f $P/layer/packages.txt ]]; then
-  mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$P/layer/packages.txt")
+# Each layer's own packages.txt (same format), also from the pinned snapshot: the layer.sh scripts
+# run after the sources point at the live archive, so they must not apt-get themselves.
+layers=()
+[[ ! -d $P/layers ]] || mapfile -t layers < <(find "$P/layers" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+for l in "${layers[@]}"; do
+  [[ -f $l/packages.txt ]] || continue
+  mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$l/packages.txt")
   [[ ${#pkgs[@]} -eq 0 ]] || apt_get -y -q install --no-install-recommends "${pkgs[@]}"
-fi
+done
 
 # Docker CE from download.docker.com, every package version pinned (that repo has no snapshots).
 install -D -m 0644 "$P/docker.asc" /etc/apt/keyrings/docker.asc
@@ -43,7 +63,7 @@ Components: stable
 Architectures: $DEB_ARCH
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-apt_get update -q --error-on=any
+apt_update
 apt_get -y -q install \
   "docker-ce=$DOCKER_CE_VERSION" "docker-ce-cli=$DOCKER_CE_VERSION" "containerd.io=$CONTAINERD_VERSION" \
   "docker-buildx-plugin=$DOCKER_BUILDX_VERSION" "docker-compose-plugin=$DOCKER_COMPOSE_VERSION"
@@ -95,13 +115,24 @@ Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
 
-# Derived image layer (e.g. ubuntu-24.04-harness), before sealing so it gets sealed too.
-if [[ -f $P/layer/layer.sh ]]; then
-  export P
+# Derived image layers (e.g. ubuntu-24.04-harness), root first, before sealing so they get sealed
+# too. Each runs as $P/layer, the path a layer.sh finds its recipe and stage at.
+export P
+for l in "${layers[@]}"; do
+  [[ -f $l/layer.sh ]] || continue
+  ln -sfn "$l" "$P/layer"
   bash -euxo pipefail "$P/layer/layer.sh"
-fi
+done
 
 # --- seal: nothing per-machine, nothing secret, nothing time-dependent ---
+# What apt fetched goes back to the build's apt cache first (build-rootfs.sh copies it out).
+if [[ -d $P/apt-cache ]]; then
+  find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp -t "$P/apt-cache/archives/" {} +
+  find /var/lib/apt/lists -maxdepth 1 -type f ! -name lock ! -name '.*' -exec cp -a -t "$P/apt-cache/lists/" {} +
+  find /var/lib/apt/davit-sources -maxdepth 1 -type f -exec cp -a -t "$P/apt-cache/markers/" {} +
+fi
+rm -rf /var/lib/apt/davit-sources # apt_update's markers
+find /var/lib/apt/lists -mindepth 1 -maxdepth 1 -name '.*' -exec rm -rf {} + # the lists/* below skips these
 apt-get clean
 rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /var/cache/debconf/*-old /var/lib/dpkg/*-old \
   /var/cache/ldconfig/aux-cache /var/lib/systemd/random-seed /var/lib/systemd/catalog/database \

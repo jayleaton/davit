@@ -431,6 +431,7 @@ Lifecycle:
   endpoints [ID]       list app endpoints; endpoints hide|show|delete [ID] NAME,
                        endpoints rename [ID] NAME NEW
   events [--follow]    the host event stream (VM, operation, run, prompt changes); --types vm.,operation.state
+  ci status            GitHub Actions runner jobs: queued, running, recent (--limit N; docs/ci-runners.md)
   webhook create URL   signed event deliveries (--event T...); list, show, update, delete, rotate, deliveries, retry
   token create NAME --action view|exec|admin [--vm VM]... [--ttl 30d]
                        service token for automation on the tailnet API (secret shown

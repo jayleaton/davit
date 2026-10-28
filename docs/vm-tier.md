@@ -85,14 +85,17 @@ sudo umount /mnt/davit-small && rm /var/tmp/davit-small.img
 
 `TestFirecrackerColdTier` (`./cmd/davit/`) checks the cold storage tier on real guests: a stopped box moves to
 cold storage and back with a 1 GiB file intact (its log lines `COLD-DEMOTE` and `COLD-PROMOTE` carry the measured
-bytes and seconds), a running box never moves, and a daemon SIGKILLed in the middle of a move recovers with the
-box's data on exactly one tier. A move must cross filesystems, so the test needs two dedicated XFS filesystems with
-reflink: the hot one is `--small-fs DIR` (above) and the cold one is `--cold-fs DIR`; 24 GiB and 32 GiB were
-enough (the cold tier keeps 5 GiB free). Without both it skips. It works in `davit-cold-*` on each, which the
-run's cleanup removes. Make the second one as the first:
+bytes and seconds), a running box never moves, a daemon SIGKILLed in the middle of a move recovers with the
+box's data on exactly one tier, and a full cold tier makes room for the next move by auto-deleting its least
+recently used unpinned box while a pinned one stays (`COLD-FULL`). A move must cross filesystems, so the test
+needs two dedicated XFS filesystems with reflink: the hot one is `--small-fs DIR` (above) and the cold one is
+`--cold-fs DIR`. The test shrinks its reserves to fit 7 GiB hot and 5 GiB cold; on 2026-10-28 (one run, VM
+110, 6 vCPUs) that passed with `--fs` on the hot one, so it also held the image blobs and scratch. The cold-full
+step relies on the cold one being that small. Without both it skips. It works in `davit-cold-*` on each, which
+the run's cleanup removes. Make the second one as the first:
 
 ```sh
-truncate -s 24G /var/tmp/davit-small.img && truncate -s 32G /var/tmp/davit-cold.img
+truncate -s 7G /var/tmp/davit-small.img && truncate -s 5G /var/tmp/davit-cold.img
 mkfs.xfs -q -m reflink=1 /var/tmp/davit-small.img && mkfs.xfs -q -m reflink=1 /var/tmp/davit-cold.img
 sudo mkdir -p /mnt/davit-small /mnt/davit-cold
 sudo mount -o loop,discard /var/tmp/davit-small.img /mnt/davit-small
@@ -123,6 +126,11 @@ Instead of sending blobs, `--images` builds `ubuntu-24.04-base` on the host from
 `--prepare` sends nothing, and prepare and runs use it instead of the committed one. The build is skipped while
 the host's image was built from the same `images/` tree (`--rebuild-images` forces one).
 
+`--image` picks what `--images` builds (repeatable), e.g. `--image ubuntu-24.04-base --image ubuntu-24.04-ci`.
+When the host has a built `ubuntu-24.04-ci` manifest, runs export its absolute path as
+`DAVIT_TEST_CI_IMAGE_MANIFEST` (its blobs are in `DAVIT_TEST_IMAGE_BLOBS` with the base image's), and prepare
+verifies its blobs too.
+
 ## Host layout
 
 | Path | |
@@ -131,7 +139,7 @@ the host's image was built from the same `images/` tree (`--rebuild-images` forc
 | `~/.svm/src` | the shipped checkout of the last run |
 | `~/.svm/runs/<run>/` | payload, `out/` (logs), `t/` (TMPDIR, short for 108-byte socket paths); removed after the run |
 | `~/.svm/fs/blobs` | image blobs (`sha256/<hex>`) |
-| `~/.svm/fs/manifests` | the base manifest built on the host (`--images`), with the `images/` tree it came from |
+| `~/.svm/fs/manifests` | the manifests built on the host (`--images`), each with the `images/` tree it came from |
 | `~/.svm/fs/images-work` | `images/build.sh` scratch |
 | `~/.svm/fs/scratch` | `DAVIT_TEST_SCRATCH`: Firecracker (`bin/`) and derived image (`images/`) persist |
 | `~/.svm/lock` | one run at a time |

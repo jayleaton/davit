@@ -71,3 +71,10 @@ PNPM_SHA256_arm64=d7ce93a2c7d847d3a34bd3f559b60c14f578b1320c17cc352a2c5c5fdf9561
 UV_VERSION=0.13.5
 UV_SHA256_x86_64=f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
 UV_SHA256_aarch64=4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
+
+# GitHub Actions runner for the ubuntu-24.04-ci image (actions/runner release tarballs; sha256 from the
+# release notes, which match the release asset digests). GitHub stops accepting a runner that falls
+# too far behind its latest release: bump this, then rebuild the image.
+ACTIONS_RUNNER_VERSION=2.338.2
+ACTIONS_RUNNER_SHA256_x64=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
+ACTIONS_RUNNER_SHA256_arm64=670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945

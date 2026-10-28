@@ -285,7 +285,9 @@ read-only and a stop failed writing its commit. The daemon now guards it:
   `autoDelete.marginBytes`. For a queued request while the host is still above the floor, it stops and
   deletes only that requester's boxes, and deletes nothing for a request that needs more than the whole
   filesystem. A run that freed nothing waits for the journal to change (a box stopped, unpinned or deleted),
-  or a minute, before the next. It goes in this order:
+  or 10 minutes, before the next, and logs one warning naming what blocks it (pinned, running, busy or
+  recently used boxes, a full cold disk), at most every 10 minutes while it stays stuck
+  ([storage-tiers.md](storage-tiers.md#when-the-cleanup-is-stuck)). It goes in this order:
   1. Garbage davit owns and can prove unused: disks and commits the journal no longer references, goldens
      that can never be restored, goldens above `firecracker.goldenMinFreeBytes` (never an image's newest),
      and image blobs no manifest or served image names (`davit box image prune`, `POST /images/prune`). A
@@ -298,18 +300,23 @@ read-only and a stop failed writing its commit. The daemon now guards it:
   4. Unused boxes are deleted, least recently used first: project images with no instances unused for
      `autoDelete.imageMinAge`, then stopped instances unused for `autoDelete.instanceMinAge`. Never one that
      is running, has a session, process or prompt lease, is queued for (a resume of it, or a create from one
-     of its image's generations), is pinned (`keep`), or is not a box. With a cold tier, only boxes still on
-     hot storage: deleting a cold one frees nothing here.
+     of its image's generations), is pinned (`keep`), is being moved between storage tiers, or is not a
+     box. With a cold tier, only boxes still on hot storage: deleting a cold one frees nothing here.
      A project image's generations and goldens go with it.
+  5. Under pressure: when the host is below its floor (not only short for a queued request) and steps 1–4
+     left it short, the age limits are waived down to 1 hour. Step 3 runs again with its cold cleanup
+     deleting cold boxes least recently used first whatever their age, then step 4 for boxes unused for at
+     least an hour. The same guards hold, and no box used within the last hour is ever deleted.
 
-  The defaults: 3 days for instances, which keeps a stopped box across a weekend away; 1 day for images
+  The defaults: 3 days for instances, which keeps a stopped box across a weekend away (12 hours on the
+  cold tier, `autoDelete.coldInstanceMinAge`); 1 day for images
   without instances, which hold nothing a `box image build` cannot make again. Each deletion is logged at
   warn level (box, age, last use, bytes freed), set as the VM's `deleteReason`, and appended as a
   `vm.autodeleted` event that `box ls`, `box ls --deleted` and `davit doctor` read.
 
 ```json
 "limits": {"minFreeDiskBytes": 5368709120, "minFreeDiskPercent": 10, "diskHeadroomPercent": 25, "saveReserveBytes": 2147483648},
-"autoDelete": {"enabled": true, "instanceMinAge": "72h", "imageMinAge": "24h", "marginBytes": 2147483648, "blobMinAge": "1h"}
+"autoDelete": {"enabled": true, "instanceMinAge": "72h", "coldInstanceMinAge": "12h", "imageMinAge": "24h", "marginBytes": 2147483648, "blobMinAge": "1h"}
 ```
 
 `capabilities.capacity` reports `freeDiskBytes`, `totalDiskBytes`, `diskFloorBytes`, `diskReservedBytes`,
@@ -317,8 +324,9 @@ read-only and a stop failed writing its commit. The daemon now guards it:
 and warns below twice the floor.
 
 **Cold storage.** A second, larger and slower local disk (`coldStorage.dir`) can take the stopped boxes nobody
-used for 6 hours (`coldStorage.after`). It keeps its own floor, and its own cleanup auto-deletes the oldest
-cold boxes only when it is full. A cold box's next resume copies its disk back first. Setup, sizing and
+used for 6 hours (`coldStorage.after`). It keeps its own floor (by default the larger of 5 GiB and 5%), and its own
+cleanup auto-deletes the oldest cold boxes (unused for 12 hours, or under pressure an hour) only when a move
+does not fit. A cold box's next resume copies its disk back first. Setup, sizing and
 operations: [storage-tiers.md](storage-tiers.md).
 
 ## Running the host as a VM (Proxmox)

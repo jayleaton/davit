@@ -292,3 +292,15 @@ func TestClientConfigMigrates(t *testing.T) {
 		t.Fatalf("ssh key not moved: %q", b)
 	}
 }
+
+// TestBoxDiskFullHint: a full box disk exits 8 with its own hint, not the
+// host-is-full one.
+func TestBoxDiskFullHint(t *testing.T) {
+	de := domain.BoxDiskFull("guest: /home/davit/work: no space left on device")
+	err := boxHint(&cliError{ErrorBody{Code: de.Code, Message: de.Message, Details: de.Details, Origin: "server"}})
+	ce := err.(*cliError)
+	if ExitCode(ce.Code) != ExitExhaustion || strings.Contains(ce.Message, "the host is full") ||
+		!strings.Contains(ce.Message, "box disk full: `davit box up --disk 40GiB` (resize) or clean the workspace") {
+		t.Fatalf("exit %d: %s", ExitCode(ce.Code), ce.Message)
+	}
+}

@@ -22,6 +22,10 @@ __all__ = [
     "AutoDeletion",
     "BatchItem",
     "BootMode",
+    "CIJob",
+    "CIJobResult",
+    "CIJobState",
+    "CIStatus",
     "CapacityWaiter",
     "ColdCapacity",
     "Consistency",
@@ -2635,9 +2639,10 @@ class TokenList(Model):
 class Event(Model):
     """One entry of the host event stream, in seq order. Types: vm.created, vm.state,
     operation.created, operation.state, operation.progress, run.created, run.state,
-    prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion);
-    tolerate unknown types. data is an allowlisted summary (IDs, states, error codes): never
-    environment values, prompt text or secrets.
+    prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion),
+    ci.job.created, ci.job.state, ci.job.refused; tolerate unknown types. data is an
+    allowlisted summary (IDs, states, error codes): never environment values, prompt text or
+    secrets.
     """
 
     seq: int
@@ -3537,6 +3542,119 @@ class RunList(Model):
     _wire_ = (
         ("items", "items", "list[Run]", True),
         ("next_cursor", "nextCursor", "str", False),
+    )
+
+
+class CIJobState(OpenEnum):
+    """Tolerate unknown values."""
+
+    QUEUED = "queued"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    DONE = "done"
+    REFUSED = "refused"
+
+
+class CIJobResult(OpenEnum):
+    """succeeded: the runner exited 0 (conclusion is its job's result); failed: it exited non-
+    zero or could not start; cancelled: the job ended, or went to another runner, before this
+    one got any; timedOut: it outlived ci.github.jobTimeout; refused: it was given a job the
+    policy refuses and its box was deleted.
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMEDOUT = "timedOut"
+    REFUSED = "refused"
+
+
+@dataclass(frozen=True, kw_only=True)
+class CIJob(Model):
+    """One queued GitHub Actions job and the runner box made for it. `jobId` is the job that
+    asked for the runner; GitHub may give the runner another queued job with the same labels
+    (`assignedJobId`).
+    """
+
+    id: str
+
+    repo: str
+    """owner/name"""
+
+    job_id: int
+    run_id: int
+    job: str
+    workflow: str | None = None
+    labels: list[str]
+    shape: str | None = None
+    state: CIJobState
+    result: CIJobResult | None = None
+
+    conclusion: str | None = None
+    """GitHub's conclusion of the job the runner ran, once known."""
+
+    error: Error | None = None
+    runner: str | None = None
+    runner_id: int | None = None
+    assigned_job_id: int | None = None
+    vm_id: str | None = None
+
+    process_id: str | None = None
+    """The runner process; its output is in the VM's process history."""
+
+    exit_code: int | None = None
+    queued_at: datetime
+    box_ready_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    ended_at: datetime | None = None
+    """When the box was gone."""
+
+    _wire_ = (
+        ("id", "id", "str", True),
+        ("repo", "repo", "str", True),
+        ("job_id", "jobId", "int", True),
+        ("run_id", "runId", "int", True),
+        ("job", "job", "str", True),
+        ("workflow", "workflow", "str", False),
+        ("labels", "labels", "list[str]", True),
+        ("shape", "shape", "str", False),
+        ("state", "state", "CIJobState", True),
+        ("result", "result", "CIJobResult", False),
+        ("conclusion", "conclusion", "str", False),
+        ("error", "error", "Error", False),
+        ("runner", "runner", "str", False),
+        ("runner_id", "runnerId", "int", False),
+        ("assigned_job_id", "assignedJobId", "int", False),
+        ("vm_id", "vmId", "str", False),
+        ("process_id", "processId", "str", False),
+        ("exit_code", "exitCode", "int", False),
+        ("queued_at", "queuedAt", "datetime", True),
+        ("box_ready_at", "boxReadyAt", "datetime", False),
+        ("started_at", "startedAt", "datetime", False),
+        ("completed_at", "completedAt", "datetime", False),
+        ("ended_at", "endedAt", "datetime", False),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CIStatus(Model):
+    """The ``CIStatus`` wire object."""
+
+    enabled: bool
+    max_concurrent_jobs: int
+    queued: list[CIJob]
+    running: list[CIJob]
+    recent: list[CIJob]
+
+    _wire_ = (
+        ("enabled", "enabled", "bool", True),
+        ("max_concurrent_jobs", "maxConcurrentJobs", "int", True),
+        ("queued", "queued", "list[CIJob]", True),
+        ("running", "running", "list[CIJob]", True),
+        ("recent", "recent", "list[CIJob]", True),
     )
 
 

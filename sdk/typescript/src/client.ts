@@ -16,6 +16,7 @@ import type {
   AddMemberRequest,
   AppEndpoint,
   AppEndpointList,
+  CIStatus,
   Conversation,
   ConversationList,
   CreateAppEndpointRequest,
@@ -253,6 +254,7 @@ export const OPERATIONS = Object.freeze({
   rotateWebhookSecret: ["POST", "/webhooks/{webhookId}/rotate-secret"],
   listWebhookDeliveries: ["GET", "/webhooks/{webhookId}/deliveries"],
   retryWebhookDelivery: ["POST", "/webhooks/{webhookId}/deliveries/{deliveryId}/retry"],
+  getCIStatus: ["GET", "/ci/status"],
 } as const satisfies Record<string, readonly [Method, string]>);
 
 /** operationIds in the v1 contract that this SDK does not wrap yet (the server returns 501). */
@@ -362,6 +364,12 @@ export interface PageOptions extends RequestOptions {
   limit?: number;
   /** `nextCursor` of the previous page. */
   cursor?: string;
+}
+
+/** Options of `getCIStatus`. */
+export interface CIStatusOptions extends RequestOptions {
+  /** At most this many `recent` jobs (1..200; server default 20). */
+  limit?: number;
 }
 
 /** Options of `createShare` and the `share*` helpers. */
@@ -2562,6 +2570,18 @@ export class DavitClient {
   async getEnvironmentRevision(environment: string, revision: number, opts: RequestOptions = {}): Promise<EnvironmentRevision> {
     if (!Number.isInteger(revision) || revision < 1) throw new TypeError(`revision must be an integer >= 1, got ${String(revision)}`);
     return this.#call("getEnvironmentRevision", { params: { environmentId: environment, revision: String(revision) }, opts });
+  }
+
+  // ---- CI runners ----------------------------------------------------------
+
+  /**
+   * The host's GitHub Actions runner jobs (owner only): `queued` in FIFO
+   * order, `running` (starting, running, stopping) and `recent` (done,
+   * refused), newest first. `enabled` is false, and the lists empty, when
+   * `ci.github` is off. A non-owner caller gets `PermissionDenied`.
+   */
+  getCIStatus(opts: CIStatusOptions = {}): Promise<CIStatus> {
+    return this.#call("getCIStatus", { query: DavitClient.#page(opts), opts });
   }
 
   // ---- events and webhooks -------------------------------------------------

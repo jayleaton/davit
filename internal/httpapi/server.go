@@ -53,6 +53,7 @@ type Server struct {
 	prompts  *harness.Service
 	jobs     *jobs.Service
 	runs     *runs.Service
+	ci       CIRunners
 	sshCreds SSHCredentialIssuer
 	tokens   *tokens.Service
 	// credentials is the G4 control plane (credentials.go).
@@ -157,6 +158,7 @@ func (s *Server) Handler() http.Handler {
 	route("GET "+b+"/environments/{environmentId}/revisions", onEnvironment(view), s.listEnvironmentRevisions)
 	route("POST "+b+"/environments/{environmentId}/revisions", ownerOnly, s.createEnvironmentRevision)
 	route("GET "+b+"/environments/{environmentId}/revisions/{revision}", onEnvironment(view), s.getEnvironmentRevision)
+	route("GET "+b+"/ci/status", ownerOnly, s.getCIStatus)
 	route("GET "+b+"/runs", allVMs(view), s.listRuns)
 	route("POST "+b+"/runs", allVMs(admin), s.createRun)
 	route("GET "+b+"/runs/{runId}", allVMs(view), s.getRun)

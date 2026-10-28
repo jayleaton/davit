@@ -8,11 +8,17 @@ import (
 	"testing"
 )
 
-// TestStorageTiersDocConfigsLoad loads every ```json block of
-// docs/storage-tiers.md through Load: each must be a complete host config
+// TestDocConfigsLoad loads every ```json block of docs/storage-tiers.md
+// and docs/ci-runners.md through Load: each must be a complete host config
 // that the daemon accepts (fragments use another fence language).
-func TestStorageTiersDocConfigsLoad(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "storage-tiers.md"))
+func TestDocConfigsLoad(t *testing.T) {
+	for _, doc := range []string{"storage-tiers.md", "ci-runners.md"} {
+		t.Run(doc, func(t *testing.T) { docConfigsLoad(t, doc) })
+	}
+}
+
+func docConfigsLoad(t *testing.T, doc string) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", doc))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +55,6 @@ func TestStorageTiersDocConfigsLoad(t *testing.T) {
 		}
 	}
 	if n == 0 {
-		t.Fatal("docs/storage-tiers.md has no ```json blocks")
+		t.Fatalf("docs/%s has no ```json blocks", doc)
 	}
 }

@@ -32,14 +32,21 @@ inner_ensure() {
   mkdir -p "$BROOT"
   tar -xzf "$DL/ubuntu-base-$UBUNTU_BASE_VERSION-$HOST_DEB_ARCH.tar.gz" -C "$BROOT" --numeric-owner
   apt_setup "$BROOT" "$HOST_DEB_ARCH"
+  apt_cache_seed "$BROOT" "$HOST_DEB_ARCH"
   ln -sfn /proc/self/mounts "$BROOT/etc/mtab" # mke2fs checks it before writing an image
   chroot_mount "$BROOT"
-  # A failed apt-get reruns after 30 s, 60 s, ...; update fails on any index error (provision.sh's apt_get).
+  # A failed apt-get reruns after 30 s, 60 s, ...; update fails on any index error, and is skipped for
+  # indexes of the same sources from the apt cache (provision.sh's apt_get and apt_update).
   # shellcheck disable=SC2016 # expands inside the chroot's shell
   chroot "$BROOT" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive \
     /bin/sh -euxc 'r() { n=0; until apt-get "$@"; do n=$((n + 1)); [ $n -le 7 ] || exit 1; sleep $((n * 30)); done; }
-      r update -q --error-on=any; r -y -q dist-upgrade; r -y -q install "$@"; apt-get clean' \
+      m=/var/lib/apt/davit-sources/$(cat /etc/apt/sources.list.d/*.sources | sha256sum | cut -c1-16)
+      [ -f "$m" ] || { r update -q --error-on=any; mkdir -p "${m%/*}"; : >"$m"; }
+      r -y -q dist-upgrade; r -y -q install "$@"' \
     sh "${PKGS[@]}"
+  apt_cache_harvest "$BROOT/var/cache/apt/archives" "$BROOT/var/lib/apt/lists" "$BROOT/var/lib/apt/davit-sources" \
+    "$HOST_DEB_ARCH"
+  chroot "$BROOT" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin apt-get clean
   # Pinned mke2fs -> /opt/e2fsprogs/sbin (static against e2fsprogs' own libs).
   mkdir -p "$BROOT/src"
   tar -xJf "$DL/e2fsprogs-$E2FSPROGS_VERSION.tar.xz" -C "$BROOT/src" --no-same-owner

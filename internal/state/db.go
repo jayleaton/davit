@@ -444,6 +444,19 @@ UPDATE vms SET doc = json_set(json_remove(doc, '$.labels."slipway.box.role"'), '
 UPDATE vms SET doc = json_set(json_remove(doc, '$.labels."slipway.box.generation"'), '$.labels."davit.box.generation"', json_extract(doc, '$.labels."slipway.box.generation"'))
 	WHERE CASE WHEN json_valid(doc) THEN json_extract(doc, '$.labels."slipway.box.generation"') IS NOT NULL ELSE 0 END;
 `,
+	// 10: CI runner jobs (internal/ci), one document each, unique per
+	// provider job so a job seen by webhook and poll is recorded once.
+	10: `
+CREATE TABLE ci_jobs (
+	id           TEXT PRIMARY KEY,
+	provider_job TEXT NOT NULL UNIQUE,
+	state        TEXT NOT NULL,
+	created_ns   INTEGER NOT NULL,
+	doc          TEXT NOT NULL
+) STRICT;
+CREATE INDEX ci_jobs_unfinished ON ci_jobs(state) WHERE state IN ('queued', 'starting', 'running', 'stopping');
+CREATE INDEX ci_jobs_created ON ci_jobs(created_ns);
+`,
 }
 
 func (d *DB) migrate(ctx context.Context) error {

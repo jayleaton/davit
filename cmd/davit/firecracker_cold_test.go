@@ -34,7 +34,16 @@ import (
 //  4. a daemon SIGKILLed mid-move (a box with 1.5 GiB of its own data,
 //     copied at 32 MiB/s) recovers: no partial copy left in the cold tmp/,
 //     the box's commit on exactly one tier (the one its record names), and
-//     it resumes with its file intact.
+//     it resumes with its file intact;
+//  5. cold full: a pinned box and then proj/big fill the cold tier, so the
+//     next move (proj/c) does not fit; the cold cleanup auto-deletes
+//     proj/big (least recently used unpinned, past
+//     autoDelete.coldInstanceMinAge) and the move goes ahead (COLD-FULL);
+//     the pinned box, older still, stays, and proj/c resumes intact.
+//
+// The reserves are shrunk to fit two small filesystems (7 GiB hot, 5 GiB
+// cold): hot floor 1 GiB, save reserve 512 MiB, 5% growth headroom, cold
+// floor 256 MiB, cleanup margin 256 MiB.
 func TestFirecrackerColdTier(t *testing.T) {
 	small, coldFS := os.Getenv("DAVIT_TEST_SMALL_FS"), os.Getenv("DAVIT_TEST_COLD_FS")
 	if small == "" || coldFS == "" {
@@ -45,6 +54,7 @@ func TestFirecrackerColdTier(t *testing.T) {
 	}
 	gib := int64(domain.GiB)
 	const mib = int64(1 << 20)
+	const coldAge = 30 * time.Second // autoDelete.coldInstanceMinAge
 	var hs, cs unix.Statfs_t
 	if err := unix.Statfs(small, &hs); err != nil {
 		t.Fatal(err)
@@ -70,10 +80,12 @@ func TestFirecrackerColdTier(t *testing.T) {
 	var data string
 	h := newFCHostIn(t, root, func(c *config.Daemon) {
 		data = c.DataDir
-		c.Limits.MinFreeDiskBytes, c.Limits.MinFreeDiskPercent = 2*gib, -1
+		c.Limits.MinFreeDiskBytes, c.Limits.MinFreeDiskPercent = gib, -1
+		c.Limits.SaveReserveBytes, c.Limits.DiskHeadroomPercent = 512*mib, 5
 		c.Limits.ReclaimIdleAfterSeconds = -1 // the test stops boxes itself
 		c.ColdStorage = config.ColdStorage{Dir: cold, After: config.Duration(time.Second), MinBytes: 256 * mib,
-			BytesPerSecond: -1, IOBusyPercent: -1}
+			BytesPerSecond: -1, IOBusyPercent: -1, MinFreeBytes: 256 * mib, MinFreePercent: -1}
+		c.AutoDelete.ColdInstanceMinAge, c.AutoDelete.MarginBytes = config.Duration(coldAge), 256*mib
 		// The image moves into the data dir's own catalog, on the hot
 		// filesystem: disks reflink from its rootfs, restores rebase on it.
 		copyImage(t, c.Images[0], filepath.Join(c.DataDir, "images"))
@@ -208,6 +220,13 @@ func TestFirecrackerColdTier(t *testing.T) {
 	}
 	t.Logf("item 3 (running box stays hot): ok after %s", time.Since(liveUp).Round(time.Second))
 
+	// proj/a's restore left its cold copy in use while it runs (its next
+	// stop drops it): stop it pinned hot, so the cold tier holds only what
+	// items 4 and 5 move.
+	box("pin", "proj/a", "--hot")
+	box("down", "proj/a")
+	waitFor("proj/a's cold copy dropped", time.Minute, func() bool { return len(coldCommits()) == 0 })
+
 	// 4. A kill mid-move: slow moves, a large box.
 	h.stopDaemon()
 	h.cfg.ColdStorage.BytesPerSecond = 32 * mib
@@ -271,6 +290,60 @@ func TestFirecrackerColdTier(t *testing.T) {
 		t.Fatalf("cold tmp after the resume: %v", left)
 	}
 	t.Logf("item 4 (kill mid-move): ok; proj/big resumed from %s, big.bin sha256 matches", tr)
+
+	// 5. Cold full. Moves are due again (after 1s, unlimited rate).
+	h.stopDaemon()
+	h.cfg.ColdStorage.After, h.cfg.ColdStorage.BytesPerSecond = config.Duration(time.Second), -1
+	h.startDaemon()
+	down := func(ref, name string) {
+		t.Helper()
+		if h.info(name).State != domain.StateStopped {
+			box("down", ref)
+		}
+		waitFor(ref+" cold", 5*time.Minute, func() bool { return tier(name) == domain.TierCold })
+	}
+	box("up", "proj/pin", "--cpus", "1", "--memory", "1GiB")
+	fill("proj/pin", "pin.bin", 384)
+	box("pin", "proj/pin")
+	down("proj/pin", "proj--pin") // the least recently used cold box, but pinned
+	down("proj/big", "proj--big")
+	bigCold := time.Now()
+	box("up", "proj/c", "--cpus", "1", "--memory", "1GiB")
+	sumC := fill("proj/c", "c.bin", 384)
+	time.Sleep(time.Until(bigCold.Add(coldAge + 5*time.Second)))
+	var st unix.Statfs_t
+	if err := unix.Statfs(coldFS, &st); err != nil {
+		t.Fatal(err)
+	}
+	coldFree := int64(st.Bavail) * st.Bsize
+	t.Logf("cold storage before proj/c's move: %s free; proj/pin %s and proj/big %s on it", domain.HumanBytes(coldFree),
+		domain.HumanBytes(h.info("proj--pin").ColdBytes), domain.HumanBytes(h.info("proj--big").ColdBytes))
+	start = time.Now()
+	box("down", "proj/c")
+	waitFor("proj/c cold", 5*time.Minute, func() bool { return tier("proj--c") == domain.TierCold })
+	evicted := regexp.MustCompile(`msg="auto-deleted unused box to free disk space" box=proj/big kind=instance .*freedBytes=(\d+)`)
+	movedC := regexp.MustCompile(`msg="moved vm to cold storage" .*name=proj--c .*coldBytes=(\d+) .*seconds=([0-9.]+)`)
+	waitFor("proj/c moved log line", 30*time.Second, func() bool { return logLine(movedC) != nil })
+	e, mc := logLine(evicted), logLine(movedC)
+	if e == nil {
+		t.Fatalf("proj/c moved without evicting proj/big: was cold storage full? (%s free before)\ndaemon log tail:\n%s",
+			domain.HumanBytes(coldFree), tail(h.log.String(), 6000))
+	}
+	so, _ = box("ls", "--deleted")
+	if !strings.Contains(so, "instance proj/big auto-deleted") || !strings.Contains(so, "cold storage low") {
+		t.Fatalf("box ls --deleted: %s", so)
+	}
+	if p := h.info("proj--pin"); p.State != domain.StateStopped || tier("proj--pin") != domain.TierCold {
+		t.Fatalf("the pinned cold box: %s on %s", p.State, tier("proj--pin"))
+	}
+	oneCopy()
+	t.Logf("COLD-FULL cold_free_before=%d evicted=proj/big evicted_freed_cold_bytes=%s moved=proj/c cold_bytes=%s move_seconds=%s "+
+		"down_to_cold_s=%.1f pinned_kept=proj/pin", coldFree, e[1], mc[1], mc[2], time.Since(start).Seconds())
+	box("up", "proj/c")
+	if got := sum("proj/c", "c.bin"); got != sumC {
+		t.Fatalf("c.bin after the move: sha256 %s, want %s", got, sumC)
+	}
+	t.Logf("item 5 (cold full): ok; proj/big evicted for proj/c, proj/pin kept, c.bin sha256 matches")
 }
 
 // sha is the digest of sha256sum's output.

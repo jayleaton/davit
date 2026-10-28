@@ -295,6 +295,17 @@ func RunWith(ctx context.Context, cfg config.Daemon, log *slog.Logger, opts Opti
 		defer rs.Close()
 	}
 
+	// CI runners (ci.github): one fresh box per queued GitHub Actions job.
+	ciRunners, err := startCI(ctx, cfg, db, svc, procs, log)
+	if err != nil {
+		return err
+	}
+	var ciAPI httpapi.CIRunners // nil interface when off
+	if ciRunners != nil {
+		defer ciRunners.Close()
+		ciAPI = ciRunners
+	}
+
 	// issueSSHCredential: certificates from the guest SSH CA for this VM
 	// generation, host keys pinned from the barrier's registry.
 	var creds httpapi.SSHCredentialIssuer
@@ -342,7 +353,7 @@ func RunWith(ctx context.Context, cfg config.Daemon, log *slog.Logger, opts Opti
 		defer mem.Close()
 	}
 
-	stopTailnet, err := startTailnet(ctx, cfg, svc, procs, prompts, jobSvc, rs, creds, toks, credControl, files, rev, apps, g16, mem, sessions, opts, log)
+	stopTailnet, err := startTailnet(ctx, cfg, svc, procs, prompts, jobSvc, rs, creds, toks, credControl, files, rev, apps, g16, mem, sessions, ciAPI, opts, log)
 	if err != nil {
 		return err
 	}
@@ -359,6 +370,7 @@ func RunWith(ctx context.Context, cfg config.Daemon, log *slog.Logger, opts Opti
 	api.SetSnapshotFiles(files)
 	api.SetReverse(rev)
 	api.SetJobs(jobSvc) // host records: works without a guest transport
+	api.SetCI(ciAPI)
 	if cfg.Tailnet.Enabled {
 		api.SetAppEndpoints(apps)
 		api.SetMembers(mem, sessions)
@@ -704,7 +716,7 @@ func autoDeletePolicy(a config.AutoDelete) lifecycle.AutoDeletePolicy {
 	return lifecycle.AutoDeletePolicy{
 		Disabled:       a.Enabled != nil && !*a.Enabled,
 		InstanceMinAge: time.Duration(a.InstanceMinAge), ImageMinAge: time.Duration(a.ImageMinAge),
-		MarginBytes: a.MarginBytes,
+		ColdInstanceMinAge: time.Duration(a.ColdInstanceMinAge), MarginBytes: a.MarginBytes,
 	}
 }
 
@@ -786,7 +798,7 @@ func newCatalog(ctx context.Context, cfg config.Daemon) (lifecycle.ImageCatalog,
 // stop function waits for that and closes the node.
 func startTailnet(ctx context.Context, cfg config.Daemon, svc *lifecycle.Service, procs *guestexec.Manager, prompts *harness.Service, jobSvc *jobs.Service,
 	rs *runs.Service, creds httpapi.SSHCredentialIssuer, toks *tokens.Service, credControl *credproxy.Control, files *snapfiles.Service, rev *reversefwd.Service, apps *appendpoint.Service, g16 *g16,
-	mem *members.Service, sessions *gateway.Sessions, opts Options, log *slog.Logger) (func(), error) {
+	mem *members.Service, sessions *gateway.Sessions, ciAPI httpapi.CIRunners, opts Options, log *slog.Logger) (func(), error) {
 	t := cfg.Tailnet
 	if !t.Enabled {
 		return func() {}, nil
@@ -817,6 +829,7 @@ func startTailnet(ctx context.Context, cfg config.Daemon, svc *lifecycle.Service
 	api.SetSnapshotFiles(files)
 	api.SetReverse(rev)
 	api.SetJobs(jobSvc) // host records: works without a guest transport
+	api.SetCI(ciAPI)
 	api.SetAppEndpoints(apps)
 	g16.apply(api)
 	api.SetMembers(mem, sessions)

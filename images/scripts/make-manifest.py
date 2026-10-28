@@ -50,15 +50,24 @@ def blob(hexdigest):
     return {"digest": f"sha256:{hexdigest}", "size": os.path.getsize(path)}
 
 
+def chain(image):
+    """The recipes that build image, root first: each derived recipe names its parent in
+    rootfs/<image>/base, and the root (no base) provisions."""
+    names = [image]
+    while os.path.exists(f"{IMAGES}/rootfs/{names[-1]}/base"):
+        parent = open(f"{IMAGES}/rootfs/{names[-1]}/base").read().strip()
+        if parent in names:
+            sys.exit(f"{image}: base cycle {' -> '.join(names + [parent])}")
+        if not parent or not os.path.isdir(f"{IMAGES}/rootfs/{parent}"):
+            sys.exit(f"{names[-1]}: base names no recipe (got {parent!r})")
+        names.append(parent)
+    return names[::-1]
+
+
 def base_of(image):
-    """The parent recipe of a derived image (rootfs/<image>/base), or None. One level only."""
-    path = f"{IMAGES}/rootfs/{image}/base"
-    if not os.path.exists(path):
-        return None
-    base = open(path).read().strip()
-    if base == image or os.path.exists(f"{IMAGES}/rootfs/{base}/base"):
-        sys.exit(f"{image}: base must name a non-derived recipe (got {base!r})")
-    return base
+    """The parent recipe of a derived image (rootfs/<image>/base), or None."""
+    names = chain(image)
+    return names[-2] if len(names) > 1 else None
 
 
 # Files that shape each output (not test or manifest tooling, so editing smoke.py needs no rebuild).
@@ -68,10 +77,8 @@ KERNEL_RECIPE = ["inputs.lock", "kernel", "scripts/lib.sh", "scripts/builder.sh"
 
 def rootfs_recipe(image):
     paths = ["inputs.lock", "scripts/lib.sh", "scripts/builder.sh", "scripts/build-rootfs.sh",
-             "scripts/build-agent.sh", f"rootfs/{image}"]
-    if base_of(image):
-        paths.append(f"rootfs/{base_of(image)}")
-    return paths
+             "scripts/build-agent.sh"]
+    return paths + [f"rootfs/{name}" for name in chain(image)]
 
 
 def recipe_files(paths):
@@ -96,6 +103,9 @@ def main():
     if sys.argv[1] == "--recipe-digest":  # used by the build scripts: <kernel|image>
         scope = sys.argv[2]
         print(recipe_digest(recipe_files(KERNEL_RECIPE if scope == "kernel" else rootfs_recipe(scope))))
+        return
+    if sys.argv[1] == "--chain":  # used by build-rootfs.sh: <image> -> its recipes, root first
+        print(" ".join(chain(sys.argv[2])))
         return
     image, arch = sys.argv[1], sys.argv[2]
     deb_arch = {"x86_64": "amd64", "aarch64": "arm64"}[arch]
@@ -122,18 +132,21 @@ def main():
         sys.exit(f"rootfs was built against kernel {r['ROOTFS_KERNEL_BLOB'][:12]} (modules.builtin), "
                  f"but the current kernel is {k['KERNEL_BLOB'][:12]}: rebuild the rootfs")
 
-    # Image capabilities (e.g. harness.claude): declared by the recipe, versions from its npm lock.
+    # Image capabilities (e.g. harness.claude): declared by each recipe in the chain, root first
+    # (a derived image keeps its parents' and may redeclare one), versions from its npm lock.
     capabilities = {}
-    cap_path = f"{IMAGES}/rootfs/{image}/capabilities.json"
-    # An npm capability takes its version and integrity from the recipe's npm lock; any other
-    # names the inputs.lock variable that pins it (versionVar), formatted as the command prints
-    # it (versionFormat, default "{}").
-    if os.path.exists(cap_path):
+    # An npm capability takes its version and integrity from the declaring recipe's npm lock; any
+    # other names the inputs.lock variable that pins it (versionVar), formatted as the command
+    # prints it (versionFormat, default "{}").
+    for recipe_name in chain(image):
+        cap_path = f"{IMAGES}/rootfs/{recipe_name}/capabilities.json"
+        if not os.path.exists(cap_path):
+            continue
         npm_lock = None
         for name, c in json.load(open(cap_path)).items():
             if "npmPackage" in c:
                 if npm_lock is None:
-                    npm_lock = json.load(open(f"{IMAGES}/rootfs/{image}/npm/package-lock.json"))["packages"]
+                    npm_lock = json.load(open(f"{IMAGES}/rootfs/{recipe_name}/npm/package-lock.json"))["packages"]
                 pkg = npm_lock[f"node_modules/{c['npmPackage']}"]
                 capabilities[name] = {**c, "version": pkg["version"], "integrity": pkg["integrity"],
                                       "node": lock["NODE_VERSION"]}

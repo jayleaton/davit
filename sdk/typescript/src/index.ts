@@ -26,6 +26,7 @@ export {
 export type {
   AttachOptions,
   BatchOptions,
+  CIStatusOptions,
   CreateWebhookOptions,
   EventFilterOptions,
   ClientOptions,

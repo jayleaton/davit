@@ -9,7 +9,8 @@
 #   images/build.sh manifest        manifests for each of $IMAGES
 #   images/build.sh clean           drop scratch ($DAVIT_IMAGES_WORK) except downloads; keeps out/
 #
-# Env: IMAGES (all recipes in rootfs/: ubuntu-24.04-base ubuntu-24.04-dev ubuntu-24.04-harness) ARCH (host)
+# Env: IMAGES (all recipes in rootfs/: ubuntu-24.04-base ubuntu-24.04-ci ubuntu-24.04-dev
+#      ubuntu-24.04-harness) ARCH (host)
 #      SIZE (4G) JOBS (4) KEEP_WORK=1 DAVIT_ALLOW_DIRTY=1 (development agent from a dirty tree)
 #      DAVIT_IMAGES_WORK (default ~/.cache/davit/images) / DAVIT_IMAGES_OUT (images/out)
 #      DAVIT_MANIFESTS (images/manifests; point elsewhere for development builds).

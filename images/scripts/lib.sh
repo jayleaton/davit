@@ -6,6 +6,8 @@
 #                        (default ${XDG_CACHE_HOME:-~/.cache}/davit/images: outside the source
 #                        tree, whose tools (gofmt -l ., editors) choke on subuid-owned chroot dirs)
 #   DAVIT_IMAGES_OUT   content-addressed outputs: blobs/sha256/<hex>  (default images/out)
+#   DAVIT_APT_CACHE    optional: the pinned snapshot's package indexes and .debs, kept between
+#                        builds (<dir>/<deb-arch>/{archives,lists}); see apt_cache_seed
 set -euo pipefail
 # File modes in the image must not depend on the caller's umask.
 umask 022
@@ -73,6 +75,40 @@ Dpkg::Use-Pty "false";
 EOF
   printf '#!/bin/sh\nexit 101\n' >"$r/usr/sbin/policy-rc.d"
   chmod 0755 "$r/usr/sbin/policy-rc.d"
+}
+
+# DAVIT_APT_CACHE: the pinned snapshot never changes, so its indexes and packages, once fetched,
+# serve every later build with the same inputs without reaching the mirror. apt_cache_seed copies
+# them into a tree before apt runs there; apt_cache_harvest copies back what apt fetched. Neither
+# reaches an image: the seal runs apt-get clean and empties /var/lib/apt/lists. The indexes are
+# used without `apt-get update` only for the exact sources that fetched them: an empty marker file
+# per source set in /var/lib/apt/davit-sources (not in lists/, which apt-get update prunes).
+APT_CACHE=${DAVIT_APT_CACHE:-}
+
+apt_cache_seed() { # <root> <deb-arch>
+  local r=$1 c=$APT_CACHE/$2
+  [[ -n $APT_CACHE ]] || return 0
+  mkdir -p "$c/archives" "$c/lists" "$c/markers" "$r/var/cache/apt/archives" "$r/var/lib/apt/lists" \
+    "$r/var/lib/apt/davit-sources"
+  find "$c/archives" -maxdepth 1 -name '*.deb' -exec cp --reflink=auto -t "$r/var/cache/apt/archives/" {} +
+  find "$c/lists" -maxdepth 1 -type f ! -name '.*' -exec cp -a -t "$r/var/lib/apt/lists/" {} +
+  cp -a "$c/markers/." "$r/var/lib/apt/davit-sources/"
+  # apt downloads through archives/partial, so in a build that fetches anything its mtime ends up
+  # newer than SOURCE_DATE_EPOCH and is clamped to it; one served entirely from here must end the
+  # same, or the image differs in that one timestamp.
+  mkdir -p "$r/var/cache/apt/archives/partial"
+  touch "$r/var/cache/apt/archives/partial"
+  log "apt cache: seeded $(find "$c/archives" -maxdepth 1 -name '*.deb' | wc -l) packages and the indexes of $(find "$c/markers" -maxdepth 1 -type f | wc -l) source sets"
+}
+
+apt_cache_harvest() { # <archives dir> <lists dir> <markers dir> <deb-arch>
+  local c=$APT_CACHE/$4
+  [[ -n $APT_CACHE ]] || return 0
+  mkdir -p "$c/archives" "$c/lists" "$c/markers"
+  find "$1" -maxdepth 1 -name '*.deb' -exec cp -n --reflink=auto -t "$c/archives/" {} +
+  find "$2" -maxdepth 1 -type f ! -name lock ! -name '.*' -exec cp -a -t "$c/lists/" {} +
+  find "$3" -maxdepth 1 -type f -exec cp -a -t "$c/markers/" {} +
+  log "apt cache: $(find "$c/archives" -maxdepth 1 -name '*.deb' | wc -l) packages in $c"
 }
 
 fetch_ubuntu_base() { # <deb-arch>

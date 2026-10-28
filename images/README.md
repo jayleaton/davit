@@ -35,7 +35,8 @@ The *product* still needs privilege for things the image doesn't do: guest inter
 | `kernel/davit.config`, `davit-<arch>.config` | Fragments merged onto Firecracker's `microvm-kernel-ci-<arch>-6.18.config` |
 | `rootfs/ubuntu-24.04-base/` | `packages.txt`, `provision.sh` (runs in the chroot) and `overlay/` (config files) |
 | `rootfs/ubuntu-24.04-harness/` | Derived image: `base` (parent recipe), `stage.sh` (host-side verified downloads), `layer.sh` (runs in the chroot before sealing), `npm/` (package.json + lockfile), `capabilities.json`, `overlay/` |
-| `rootfs/ubuntu-24.04-dev/` | Derived image for project boxes: `base`, `packages.txt` (extra Ubuntu packages from the pinned snapshot, installed by the parent's provision.sh; a layer must not apt-get, the archive is live by then), `stage.sh` (Go, Node.js, mise, pnpm, uv, each pinned in `inputs.lock`), `layer.sh` (installs them and checks each version through a login shell), `capabilities.json` (`toolchain.*`, version from an `inputs.lock` variable), `overlay/` |
+| `rootfs/ubuntu-24.04-dev/` | Derived image for project boxes: `base`, `packages.txt` (extra Ubuntu packages from the pinned snapshot, installed by the root recipe's provision.sh; a layer must not apt-get, the archive is live by then), `stage.sh` (Go, Node.js, mise, pnpm, uv, each pinned in `inputs.lock`), `layer.sh` (installs them and checks each version through a login shell), `capabilities.json` (`toolchain.*`, version from an `inputs.lock` variable), `overlay/` |
+| `rootfs/ubuntu-24.04-ci/` | Derived from `ubuntu-24.04-dev`: `base`, `packages.txt` (the runner's .NET dependencies, pip), `stage.sh` (the GitHub Actions runner, pinned in `inputs.lock`), `layer.sh` (user `runner`, `/opt/actions-runner`, `/opt/hostedtoolcache`; checks the runner's version as `runner`), `overlay/` (runner's sudoers) |
 | `scripts/build-agent.sh` | Guest agent: the repo's `davit` binary at HEAD, with a version gate |
 | `smokeprobe/` | Go helper for smoke: runs the product's `guestclient` restore barrier and exec over Firecracker hybrid vsock |
 | `scripts/builder.sh` | Pinned build environment: an Ubuntu 24.04 userns chroot from the same snapshot, plus mke2fs 1.47.4 built from source |
@@ -48,6 +49,7 @@ The *product* still needs privilege for things the image doesn't do: guest inter
 | `results/` (ignored) | Raw smoke JSON written by each smoke run; [RESULTS.md](RESULTS.md) summarizes them. Never committed |
 | `$DAVIT_IMAGES_WORK` (default `~/.cache/davit/images`, outside the repo) | Downloads, builder chroot, kernel/rootfs trees, smoke scratch. `build.sh clean` drops all of it except downloads. Kept out of the source tree because its subuid-owned chroot dirs break repo-wide tools such as `gofmt -l .` |
 | `out/blobs/sha256/` (ignored) | Built artifacts, named by digest. Never committed |
+| `$DAVIT_APT_CACHE` (optional, unset by default) | The pinned snapshot's package indexes and `.deb`s, kept between builds in `<dir>/<deb-arch>/`. A build with the same sources then neither runs `apt-get update` nor downloads a package it already has, so it needs no mirror; the release workflow keeps it in the Actions cache. The images do not change: the seal empties apt's cache and lists either way |
 
 `DAVIT_IMAGES_WORK` and `DAVIT_IMAGES_OUT` relocate the last two. Keep them off `/tmp` when it is RAM-backed. Retained scratch is about 0.75 GB: downloads 191 MB, builder 542 MB, Firecracker 24 MB. The kernel and rootfs trees are deleted after each step unless `KEEP_WORK=1`; their peak size wasn't measured. Outputs per build: the 29 MiB kernel and 35 MB agent are shared, and each rootfs is a sparse 4 GiB file (base ≈ 1.0 GiB allocated, harness ≈ 1.9 GiB).
 
@@ -112,6 +114,7 @@ These are what the runtime adapter, guest agent and network adapter can rely on.
 | `ubuntu-24.04-base` | Everything above | — |
 | `ubuntu-24.04-harness` | base + Node.js (pinned tarball, `/opt/node`) + Claude Code and Codex CLIs (`/opt/davit-harness`, linked into `/usr/local/bin`) | `harness.claude`, `harness.codex` |
 | `ubuntu-24.04-dev` | base + Go (mise.toml's pin), Node.js LTS, pnpm, uv, mise, common build libraries; see [docs/images.md](../docs/images.md) | `toolchain.go`, `toolchain.node`, `toolchain.pnpm`, `toolchain.uv`, `toolchain.mise` |
+| `ubuntu-24.04-ci` | dev + the GitHub Actions runner (`/opt/actions-runner`, user `runner`, uid 1001, passwordless sudo, group `docker`) and a tool cache at `/opt/hostedtoolcache`; see [docs/images.md](../docs/images.md#ubuntu-2404-ci-github-actions-runners) | dev's `toolchain.*` (inherited) |
 
 A capability in `capabilities.json` is either an npm package (`npmPackage`, version and integrity from the recipe's `npm/package-lock.json`) or a pinned input (`versionVar`: an `inputs.lock` variable, `versionFormat` such as `"go{}"` for the token the command prints). The smoke test checks `harness.*` capabilities through `--version`; a layer proves the others at build time.
 
@@ -121,7 +124,7 @@ The harness capabilities match what `internal/harness` expects: it runs a bare `
 - **Updates:** the CLIs are root-owned, and `DISABLE_AUTOUPDATER=1` is set in `/etc/profile.d`. To get newer CLIs, bump the lockfile and rebuild the image.
 - **What's tested:** neither CLI is run against a model, because that needs credentials.
 
-A derived image names its parent in `base`. The parent's `provision.sh` runs as usual, the derived recipe runs as `/.provision/layer/layer.sh` before sealing (so sealing covers it too), and its recipe digests include the parent's.
+A derived image names its parent in `base`, and the parent may be derived too (`ubuntu-24.04-ci` → `ubuntu-24.04-dev` → `ubuntu-24.04-base`; a cycle is refused). The root recipe's `provision.sh` runs as usual. It installs every layer's `packages.txt` from the snapshot, then runs each derived recipe's `layer.sh`, root first, as `/.provision/layer/layer.sh` before sealing (so sealing covers them too). Each recipe's `stage.sh` runs host-side first. The recipe digests cover every recipe in the chain, the manifest's `base` is the immediate parent, and its `capabilities` are the chain's, root first.
 
 Docs and man pages are excluded, as in ubuntu-base's minimized default (`unminimize` restores them). Masked for boot speed: apt timers, `motd-news`, `e2scrub`, `fstrim`, `getty@tty1`, `systemd-networkd-wait-online`.
 

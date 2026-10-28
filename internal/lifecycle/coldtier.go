@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -38,12 +39,14 @@ import (
 // almost nothing and slow its next resume.
 //
 // The cold tier keeps its own floor (ColdPolicy.MinFreeBytes and
-// MinFreePercent, like the data dir's limits). A
-// demotion that would take it below runs the cold cleanup first: cold
-// boxes are auto-deleted, least recently used first and only after
-// AutoDeletePolicy's instance age, until it fits. So cold fills before
-// anything is deleted, and the hot cleanup auto-deletes only what cannot
-// go cold.
+// MinFreePercent, like the data dir's limits, but 5% by default: a cold
+// disk is large, and 10% of it is more than a move needs). A demotion that
+// would take it below runs the cold cleanup first: cold boxes are
+// auto-deleted, least recently used first and only after
+// AutoDeletePolicy's cold instance age, until it fits; under pressure
+// (the hot disk below its floor with nothing else to free) down to
+// PressureDeleteAge. So cold fills before anything is deleted, and the
+// hot cleanup auto-deletes only what cannot go cold.
 //
 // Promotion without a boot is the reverse move (storage.Tiered.Promote,
 // the same switch, then GC drops the cold copies): the sweeper promotes
@@ -67,6 +70,10 @@ const (
 	// pressureColdAge is how long a VM must have been unused before the
 	// low-disk cleanup moves it early: not a stop-and-start in progress.
 	pressureColdAge = 10 * time.Minute
+	// DefaultColdMinFreePercent is the cold floor's share of the cold
+	// filesystem (with 5 GiB, the default minFreeBytes, as its least): half
+	// the hot floor's, as a cold disk is many times larger.
+	DefaultColdMinFreePercent = 5
 )
 
 // ColdPolicy configures the cold storage tier. The store must be a
@@ -93,7 +100,7 @@ type ColdPolicy struct {
 	HostBusy func() bool
 	// MinFreeBytes and MinFreePercent make the cold tier's floor, as
 	// limits.minFreeDiskBytes / minFreeDiskPercent do the data dir's (0:
-	// 5 GiB and 10%).
+	// 5 GiB and DefaultColdMinFreePercent).
 	MinFreeBytes   int64
 	MinFreePercent int
 	// Drain moves nothing to cold storage and brings every cold VM back
@@ -103,7 +110,11 @@ type ColdPolicy struct {
 
 // coldFloor is the cold tier's floor for a filesystem of total bytes.
 func (s *Service) coldFloor(total int64) int64 {
-	return domain.Limits{MinFreeDiskBytes: s.cfg.Cold.MinFreeBytes, MinFreeDiskPercent: s.cfg.Cold.MinFreePercent}.DiskFloor(total)
+	pct := s.cfg.Cold.MinFreePercent
+	if pct == 0 {
+		pct = DefaultColdMinFreePercent
+	}
+	return domain.Limits{MinFreeDiskBytes: s.cfg.Cold.MinFreeBytes, MinFreeDiskPercent: pct}.DiskFloor(total)
 }
 
 func (p *ColdPolicy) after() time.Duration { return cmpOr(p.After, DefaultColdAfter) }
@@ -287,8 +298,8 @@ func coldRestore(v domain.VM) int64 {
 
 // demote moves vm's committed disk to the cold tier. errStaysHot (with
 // why) means it is not to be moved; errColdFull that the cold tier has no
-// room even after its cleanup.
-func (s *Service) demote(ctx context.Context, id domain.VMID, reason string) error {
+// room even after its cleanup (under pressure, the pressure cleanup).
+func (s *Service) demote(ctx context.Context, id domain.VMID, reason string, pressure bool) error {
 	st, pol, ok := s.coldTier()
 	if !ok {
 		return errNoColdTier
@@ -367,8 +378,10 @@ func (s *Service) demote(ctx context.Context, id domain.VMID, reason string) err
 		}
 		need += n
 	}
-	if !s.coldRoom(ctx, need) {
-		return fmt.Errorf("%w: %s to move", errColdFull, domain.HumanBytes(need))
+	if !s.coldRoom(ctx, need, pressure) {
+		d, _ := s.coldUsage()
+		return fmt.Errorf("%w: %s to move, %s free, floor %s", errColdFull, domain.HumanBytes(need),
+			domain.HumanBytes(d.FreeBytes), domain.HumanBytes(s.coldFloor(d.TotalBytes)))
 	}
 
 	hotBefore, _, _ := s.diskUsage()
@@ -442,7 +455,7 @@ func (s *Service) demote(ctx context.Context, id domain.VMID, reason string) err
 
 // coldRoom reports whether the cold tier can take need bytes above its
 // floor, running the cold cleanup first when it cannot.
-func (s *Service) coldRoom(ctx context.Context, need int64) bool {
+func (s *Service) coldRoom(ctx context.Context, need int64, pressure bool) bool {
 	d, ok := s.coldUsage()
 	if !ok {
 		return true // not measured: the copy itself fails if it is full
@@ -451,13 +464,14 @@ func (s *Service) coldRoom(ctx context.Context, need int64) bool {
 	if d.FreeBytes-need >= floor {
 		return true
 	}
-	return s.coldCleanup(ctx, need)
+	return s.coldCleanup(ctx, need, pressure)
 }
 
 // coldCleanup auto-deletes cold boxes, least recently used first, until
 // the cold tier has need bytes above its floor plus the margin; it reports
-// whether need now fits.
-func (s *Service) coldCleanup(ctx context.Context, need int64) bool {
+// whether need now fits. Boxes go after the cold instance age, and with
+// pressure, when that is not enough, after PressureDeleteAge.
+func (s *Service) coldCleanup(ctx context.Context, need int64, pressure bool) bool {
 	_, pol, ok := s.coldTier()
 	d, measured := s.coldUsage()
 	if !ok || !measured {
@@ -475,8 +489,11 @@ func (s *Service) coldCleanup(ctx context.Context, need int64) bool {
 	if need > 0 && need > d.TotalBytes-floor {
 		return false // no deletion can make that much room
 	}
-	s.cfg.Log.Info("cold storage low: cleaning up", "freeBytes", c.free, "floorBytes", floor, "needBytes", need)
-	c.autoDelete(ctx)
+	s.cfg.Log.Debug("cold storage low: cleaning up", "freeBytes", c.free, "floorBytes", floor, "needBytes", need, "pressure", pressure)
+	if !c.autoDelete(ctx) && pressure {
+		c.pressure = true
+		c.autoDelete(ctx)
+	}
 	return c.free-need >= floor
 }
 
@@ -493,7 +510,7 @@ func (s *Service) coldSweep() {
 		defer s.coldMu.Unlock()
 		ctx := s.ctx
 		if d, ok := s.coldUsage(); ok && d.FreeBytes < s.coldFloor(d.TotalBytes) {
-			s.coldCleanup(ctx, 0)
+			s.coldCleanup(ctx, 0, false)
 		}
 		s.promoteSweep(ctx)
 		if s.cfg.Cold.Drain {
@@ -515,11 +532,19 @@ func (s *Service) coldSweep() {
 			}
 			v := vms[0]
 			tried[v.ID] = true
-			err = s.demote(ctx, v.ID, "unused")
+			err = s.demote(ctx, v.ID, "unused", false)
 			switch {
-			case err == nil, ctx.Err() != nil:
+			case err == nil:
+				s.coldFullAt = time.Time{}
+			case ctx.Err() != nil:
 			case errors.Is(err, errColdFull):
-				s.cfg.Log.Warn("cold storage: no room to move unused vms", "vm", v.ID, "err", err)
+				// Every sweep finds it full again: warn at most every stuckEvery.
+				lvl := slog.LevelDebug
+				if now := s.now(); s.coldFullAt.IsZero() || now.Sub(s.coldFullAt) >= stuckEvery {
+					lvl, s.coldFullAt = slog.LevelWarn, now
+				}
+				s.cfg.Log.Log(ctx, lvl, "cold storage: no room to move unused vms (no cold box may be deleted); retrying at each sweep, warning every "+
+					shortAge(stuckEvery), "vm", v.ID, "err", err)
 				return
 			case errors.Is(err, errStaysHot), errors.Is(err, errVMChanged), errors.Is(err, context.Canceled):
 				s.cfg.Log.Debug("cold storage: vm stays hot", "vm", v.ID, "err", err)
@@ -657,8 +682,9 @@ func (s *Service) hostBusy(ctx context.Context) bool {
 	return busy
 }
 
-// demoteForSpace is the low-disk cleanup's first tier (diskclean.go):
-// VMs go cold, least recently used first, until the target is met.
+// demoteForSpace is the low-disk cleanup's tier 3 (diskclean.go), and
+// with c.pressure part of tier 5: VMs go cold, least recently used first,
+// until the target is met.
 func (c *cleanup) demoteForSpace(ctx context.Context) bool {
 	s := c.s
 	if _, pol, ok := s.coldTier(); !ok || pol.Drain {
@@ -673,9 +699,15 @@ func (c *cleanup) demoteForSpace(ctx context.Context) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		err := s.demote(ctx, v.ID, fmt.Sprintf("host disk low (%s free, floor %s)", domain.HumanBytes(c.free), domain.HumanBytes(c.floor)))
+		err := s.demote(ctx, v.ID, fmt.Sprintf("host disk low (%s free, floor %s)", domain.HumanBytes(c.free), domain.HumanBytes(c.floor)), c.pressure)
 		if errors.Is(err, errColdFull) {
-			s.cfg.Log.Warn("low-disk cleanup: cold storage full", "err", err)
+			// The stuck log says it (diskclean.go), at most every stuckEvery.
+			s.cfg.Log.Debug("low-disk cleanup: cold storage full", "err", err, "pressure", c.pressure)
+			if c.pressure {
+				c.block("%v, and no cold box may be deleted", err)
+			} else {
+				c.block("%v", err)
+			}
 			return false
 		}
 		if err != nil {

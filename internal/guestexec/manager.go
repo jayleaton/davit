@@ -880,7 +880,7 @@ func (m *Manager) Attach(ctx context.Context, principal domain.PrincipalID, ref,
 			return nil
 		}
 		de := domain.AsError(protoErr(err))
-		return send(api.ProcessStreamMessage{Type: api.StreamError, Error: &api.Error{Code: de.Code, Message: de.Message, Retryable: de.Retryable}})
+		return send(api.ProcessStreamMessage{Type: api.StreamError, Error: &api.Error{Code: de.Code, Message: de.Message, Retryable: de.Retryable, Details: de.Details}})
 	}
 	_ = m.refresh(ctx, p, c) // picks up OutputSeq
 	p.observe(m.cfg.Now(), ex.Status, ex.ExitCode, ex.Signal, ex.TimedOut, 0)
@@ -899,6 +899,9 @@ func protoErr(err error) error {
 			return de
 		}
 		return unavailable("guest agent", err)
+	}
+	if pe.Code == guestproto.CodeInternal && domain.NoSpaceMessage(pe.Message) {
+		return domain.BoxDiskFull("guest: " + pe.Message)
 	}
 	code := domain.CodeInternal
 	switch pe.Code {

@@ -1,0 +1,11 @@
+# Extra Ubuntu packages for ubuntu-24.04-ci, on top of ubuntu-24.04-dev (base already has git,
+# build-essential, python3, curl, jq, zstd, unzip, sudo and Docker CE; dev adds python3-venv).
+# From the pinned snapshot, --no-install-recommends.
+# The runner's .NET dependencies, as its bin/installdependencies.sh installs them on noble:
+libicu74
+libkrb5-3
+zlib1g
+liblttng-ust1t64
+libssl3t64
+# pip, as on GitHub's images (venv comes with dev)
+python3-pip

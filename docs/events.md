@@ -1,6 +1,6 @@
 # Events, webhooks and OTLP export
 
-davit publishes one ordered stream of host events: VM, operation, run and prompt changes. You can read it
+davit publishes one ordered stream of host events: VM, operation, run, prompt and CI job changes. You can read it
 three ways: the API and CLI (`listEvents`, `davit events`), signed webhooks, or an OpenTelemetry collector.
 
 ## The stream
@@ -11,6 +11,7 @@ three ways: the API and CLI (`listEvents`, `davit events`), signed webhooks, or 
 | `operation.created`, `operation.state` | an operation is queued; it starts, succeeds, fails | `kind`, `state`, `previousState`, `phase`, `error` (code); `operation.created` also has `reason` for a stop the host decided on: `idle`, `ttl`, `reclaim` (made room for another VM) or `gc` (`reclaimVMs`) |
 | `operation.progress` | each journaled operation step | `seq`, `state`, `phase`, `progress` |
 | `run.created`, `run.state` | a run is created; its state changes | `state`, `previousState`, `exitCode`, `error` (code) |
+| `ci.job.created`, `ci.job.state`, `ci.job.refused` | a GitHub Actions job is queued for this host; its state changes; the host refuses it ([ci-runners.md](ci-runners.md#watching-it)). Owned by the host owner; subject: the CI job; `vmId`: its box, once it has one | `repo`, `jobId`, `job`, `state`, `previousState`, `runner`, `result`, `conclusion`, `error` (code) |
 | `prompt.created`, `prompt.state` | a prompt turn starts; its state changes | `conversationId`, `harness`, `state`, `previousState`, `error` (code) |
 | `golden.evicted` | the host evicted a golden (a booted memory snapshot of an image or project image) to keep the data dir's free-space floor; the next create that needs it captures it again. Owned by the snapshot's owner for a project image (subject: the snapshot), else by the host owner (subject: the golden) | `goldenId`, `snapshotId` (project image), `imageDigest`, `bytes` (freed), `reason` |
 | `vm.autodeleted` | the host's low-disk cleanup deleted an unused box (a stopped instance, or a project image with no instances) to get free space back above the floor ([project-boxes.md](project-boxes.md#when-the-host-is-low-on-disk)). Owned by the box's owner; subject: the VM | `vmId`, `name`, `box`, `kind` (`image`, `instance`), `lastUsedAt`, `unusedSeconds`, `freedBytes`, `deletedAt`, `reason` |

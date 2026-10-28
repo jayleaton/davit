@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"davit/internal/buildinfo"
@@ -108,6 +109,32 @@ func (l Limits) AdmitDisk(d DiskUsage, reserved, want int64) error {
 	e.Retryable = true
 	return e.WithDetail("resource", "disk").WithDetail("freeBytes", d.FreeBytes).WithDetail("needBytes", need).
 		WithDetail("floorBytes", floor).WithDetail("headroomBytes", want).WithDetail("reservedBytes", reserved)
+}
+
+// ResourceBoxDisk is the details "resource" of BoxDiskFull.
+const ResourceBoxDisk = "boxDisk"
+
+// BoxDiskFull is a write inside a box that failed because the box's own
+// disk is full (the guest's ENOSPC or EDQUOT; msg is the guest's message).
+// It is the user's to fix, by resizing the disk or cleaning the
+// workspace, not the host's: resource_exhausted (exit code 8), not
+// retryable, details resource "boxDisk".
+func BoxDiskFull(msg string) *Error {
+	n := buildinfo.Name
+	return Errorf(CodeResourceExhausted, "%s; box disk full: `%s box up --disk 40GiB` (resize) or clean the workspace", msg, n).
+		WithDetail("resource", ResourceBoxDisk)
+}
+
+// IsBoxDiskFull reports whether err is a BoxDiskFull.
+func IsBoxDiskFull(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Code == CodeResourceExhausted && e.Details["resource"] == ResourceBoxDisk
+}
+
+// NoSpaceMessage reports whether an error message from inside a guest
+// (where the host has no errno) says its filesystem is out of space.
+func NoSpaceMessage(msg string) bool {
+	return strings.Contains(msg, "no space left on device") || strings.Contains(msg, "disk quota exceeded")
 }
 
 // IsDiskSpaceError reports whether err is an AdmitDisk refusal.

@@ -114,6 +114,24 @@ func build(ctx context.Context) (Fixture, error) {
 	return f, err
 }
 
+// Derive derives a test image, the way Setup does, from another image
+// built beside the fixture's (its blobs in the same blob dir), e.g.
+// DAVIT_TEST_CI_IMAGE_MANIFEST. The returned manifest, named after the
+// image plus "-test", has its blobs in f.BlobDir.
+func (f Fixture) Derive(t testing.TB, manifest string) string {
+	t.Helper()
+	agent, err := buildDavit(context.Background(), filepath.Join(f.Scratch, "agent"))
+	if err != nil {
+		t.Fatalf("fctest: %v", err)
+	}
+	defer os.Remove(agent)
+	m, err := derive(manifest, f.SourceBlobDir, filepath.Join(f.Scratch, "images"), agent)
+	if err != nil {
+		t.Fatalf("fctest: derive %s: %v", manifest, err)
+	}
+	return m
+}
+
 // buildDavit builds a static linux/amd64 davit from this checkout.
 func buildDavit(ctx context.Context, dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {

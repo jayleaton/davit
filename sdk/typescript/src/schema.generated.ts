@@ -1126,7 +1126,8 @@ export interface TokenList {
 /**
  * One entry of the host event stream, in seq order. Types: vm.created, vm.state,
  * operation.created, operation.state, operation.progress, run.created, run.state,
- * prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion); tolerate unknown types. data is an allowlisted summary
+ * prompt.created, prompt.state, golden.evicted, vm.autodeleted (data: AutoDeletion), ci.job.created,
+ * ci.job.state, ci.job.refused; tolerate unknown types. data is an allowlisted summary
  * (IDs, states, error codes): never environment values, prompt text or secrets.
  */
 export interface Event {
@@ -1539,6 +1540,59 @@ export interface Run {
 export interface RunList {
   items: Run[];
   nextCursor?: string;
+}
+
+/** Tolerate unknown values. */
+export type CIJobState = "queued" | "starting" | "running" | "stopping" | "done" | "refused" | (string & {});
+
+/** succeeded: the runner exited 0 (conclusion is its job's result); failed: it exited non-zero or could not start; cancelled: the job ended, or went to another runner, before this one got any; timedOut: it outlived ci.github.jobTimeout; refused: it was given a job the policy refuses and its box was deleted. */
+export type CIJobResult = "succeeded" | "failed" | "cancelled" | "timedOut" | "refused" | (string & {});
+
+/** One queued GitHub Actions job and the runner box made for it. `jobId` is the job that asked for the runner; GitHub may give the runner another queued job with the same labels (`assignedJobId`). */
+export interface CIJob {
+  id: string;
+  /** owner/name */
+  repo: string;
+  jobId: number;
+  runId: number;
+  job: string;
+  workflow?: string;
+  labels: string[];
+  shape?: string;
+  state: CIJobState;
+  result?: CIJobResult;
+  /** GitHub's conclusion of the job the runner ran, once known. */
+  conclusion?: string;
+  error?: Error;
+  runner?: string;
+  runnerId?: number;
+  assignedJobId?: number;
+  vmId?: string;
+  /** The runner process; its output is in the VM's process history. */
+  processId?: string;
+  exitCode?: number;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  queuedAt: string;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  boxReadyAt?: string;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  startedAt?: string;
+  /** ISO 8601 / RFC 3339 UTC timestamp string. */
+  completedAt?: string;
+  /**
+   * When the box was gone.
+   *
+   * ISO 8601 / RFC 3339 UTC timestamp string.
+   */
+  endedAt?: string;
+}
+
+export interface CIStatus {
+  enabled: boolean;
+  maxConcurrentJobs: number;
+  queued: CIJob[];
+  running: CIJob[];
+  recent: CIJob[];
 }
 
 export interface PushResult {

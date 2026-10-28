@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,7 +236,7 @@ func TestColdTierDemoteAndRestore(t *testing.T) {
 		t.Fatalf("p--a's commit is %s", c.Tier)
 	}
 	caps := e.svc.Capabilities().Capacity.Cold
-	if caps == nil || caps.VMs != 2 || caps.FloorBytes != 25*gib || caps.AfterSeconds != int64(DefaultColdAfter/time.Second) {
+	if caps == nil || caps.VMs != 2 || caps.FloorBytes != 250*gib*DefaultColdMinFreePercent/100 || caps.AfterSeconds != int64(DefaultColdAfter/time.Second) {
 		t.Fatalf("capacity.cold: %+v", caps)
 	}
 	e.noColdPartials()
@@ -382,7 +383,7 @@ func TestColdTierCrashPoints(t *testing.T) {
 		e := setup(t)
 		e.st.slow = 64 << 10 // a 4 MiB disk takes long enough at 64 KiB/s
 		done := make(chan error, 1)
-		go func() { done <- e.svc.demote(e.ctx, e.vm("p--a").ID, "test") }()
+		go func() { done <- e.svc.demote(e.ctx, e.vm("p--a").ID, "test", false) }()
 		deadline := time.Now().Add(5 * time.Second)
 		for e.svc.demotingNow() == 0 && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
@@ -404,7 +405,7 @@ func TestColdTierCrashPoints(t *testing.T) {
 		e := setup(t)
 		e.st.copied, e.st.hold = make(chan storage.CommitID), make(chan struct{})
 		done := make(chan error, 1)
-		go func() { done <- e.svc.demote(e.ctx, e.vm("p--a").ID, "test") }()
+		go func() { done <- e.svc.demote(e.ctx, e.vm("p--a").ID, "test", false) }()
 		<-e.st.copied
 		// Pinned while the copy finished: the move aborts at its switch.
 		yes := true
@@ -452,9 +453,10 @@ func TestColdTierFirstInLowDiskCleanup(t *testing.T) {
 		t.Fatalf("hot free %d, cold free %d", hot.getFree(), cold.getFree())
 	}
 
-	// Cold at its floor (25 GiB of 250): its own cleanup deletes its
-	// oldest box (older than the instance age) before the next move.
-	cold.setFree(25 * gib)
+	// Cold below its floor (12.5 GiB, 5% of 250): its own cleanup deletes
+	// its oldest box (older than the cold instance age) before the next
+	// move.
+	cold.setFree(12 * gib)
 	hot.setFree(3 * gib)
 	e.svc.freeDisk(e.ctx, 0, "")
 	if !e.gone("p--old") || tierOf(*e.vm("p--new")) != domain.TierCold {
@@ -630,5 +632,126 @@ func TestColdTierMissingDisk(t *testing.T) {
 	e.mustSucceed(e.svc.Resume(e.ctx, e.req(e.newKey()), "p--a", api.ResumeVMRequest{}))
 	if !e.hasMarker("p--a", "waits for its disk") {
 		t.Fatal("data lost")
+	}
+}
+
+// TestColdTierEviction: the cold cleanup deletes cold boxes unused for the
+// cold instance age (12h, not the hot 72h), least recently used first; a
+// move under pressure (hot below its floor, nothing else to free) deletes
+// cold boxes past that age down to PressureDeleteAge to make room, then
+// moves. Never a pinned, busy or recently used cold box; the hot pressure
+// tier never deletes a box used within PressureDeleteAge either.
+func TestColdTierEviction(t *testing.T) {
+	gib := domain.GiB
+	hot, cold := &fakeDisk{free: 60 * gib, total: 100 * gib}, &fakeDisk{free: 200 * gib, total: 250 * gib}
+	e := newColdEnv(t, hot, cold, nil)
+	for _, n := range []string{"p--old", "p--a", "p--b", "p--busy", "p--recent"} {
+		e.box(n, instance("p", n[3:]), false, true, 6*gib)
+		e.advance(time.Minute)
+	}
+	e.box("p--pinned", instance("p", "pinned"), true, true, 6*gib)
+	e.advance(DefaultColdAfter)
+	e.sweepCold()
+	for _, n := range []string{"p--old", "p--a", "p--b", "p--busy", "p--recent", "p--pinned"} {
+		if tierOf(*e.vm(n)) != domain.TierCold {
+			t.Fatalf("%s did not go cold", n)
+		}
+	}
+
+	// Cold below its floor at the sweep: only boxes past the cold age go.
+	e.advance(DefaultAutoDeleteColdInstanceAge - DefaultColdAfter - 2*time.Minute) // p--old 12h+3m, p--a 12h+2m, p--b 12h+1m
+	e.svc.mu.Lock()
+	e.svc.activity[e.vm("p--b").ID] = e.clock().Add(-11 * time.Hour) // used since
+	e.svc.mu.Unlock()
+	cold.setFree(7 * gib) // floor 12.5, target 14.5 (the margin): two deletions
+	e.sweepCold()
+	if !e.gone("p--old") || !e.gone("p--a") || e.gone("p--b") || cold.getFree() != 19*gib {
+		t.Fatalf("cold age cleanup: old %v a %v b %v, cold free %s", e.gone("p--old"), e.gone("p--a"), e.gone("p--b"),
+			domain.HumanBytes(cold.getFree()))
+	}
+	for _, d := range e.autoDeletions() {
+		if !strings.Contains(d.Reason, "cold storage low") || strings.Contains(d.Reason, "under pressure") {
+			t.Fatalf("cold age reason: %q", d.Reason)
+		}
+	}
+
+	// Pressure: a hot box to move, cold full, nothing past any age. The
+	// move deletes the least recently used cold box past PressureDeleteAge
+	// (p--b, used 11h ago), never p--pinned, p--busy (a session) or
+	// p--recent (used 30m ago); then a second hot box finds no room and
+	// stays: it was used 20m ago, so the hot pressure tier keeps it too.
+	e.box("p--h1", instance("p", "h1"), false, true, 6*gib)
+	e.box("p--h2", instance("p", "h2"), false, true, 6*gib)
+	e.advance(20 * time.Minute)
+	e.busy.Store(e.vm("p--busy").ID, true)
+	e.svc.mu.Lock()
+	e.svc.activity[e.vm("p--recent").ID] = e.clock().Add(-30 * time.Minute)
+	e.svc.mu.Unlock()
+	cold.setFree(12 * gib)
+	hot.setFree(3 * gib)
+	e.svc.freeDisk(e.ctx, 0, "")
+	if !e.gone("p--b") {
+		t.Fatal("pressure did not evict the least recently used cold box")
+	}
+	for _, n := range []string{"p--pinned", "p--busy", "p--recent", "p--h1", "p--h2"} {
+		if e.gone(n) {
+			t.Fatalf("%s was deleted under pressure", n)
+		}
+	}
+	moved := tierOf(*e.vm("p--h1")) == domain.TierCold
+	if !moved && tierOf(*e.vm("p--h2")) != domain.TierCold {
+		t.Fatal("no hot box moved into the room the eviction made")
+	}
+	ds := e.autoDeletions()
+	if last := ds[len(ds)-1]; last.Box != "p/b" || !strings.Contains(last.Reason, "under pressure") ||
+		!strings.Contains(last.Reason, "the 12h age limit waived") {
+		t.Fatalf("pressure eviction: %+v", last)
+	}
+}
+
+// TestColdFloor: the cold floor is the larger of 5 GiB and 5% by default,
+// and follows coldStorage.minFreeBytes / minFreePercent.
+func TestColdFloor(t *testing.T) {
+	gib := domain.GiB
+	for _, c := range []struct {
+		pol         ColdPolicy
+		total, want int64
+	}{
+		{ColdPolicy{}, 250 * gib, 250 * gib / 20},
+		{ColdPolicy{}, 50 * gib, 5 * gib},
+		{ColdPolicy{MinFreePercent: 10}, 250 * gib, 25 * gib},
+		{ColdPolicy{MinFreeBytes: 20 * gib}, 250 * gib, 20 * gib},
+		{ColdPolicy{MinFreeBytes: -1}, 250 * gib, 0},
+	} {
+		s := &Service{cfg: Config{Cold: &c.pol}}
+		if got := s.coldFloor(c.total); got != c.want {
+			t.Errorf("%+v of %s: floor %s, want %s", c.pol, domain.HumanBytes(c.total), domain.HumanBytes(got), domain.HumanBytes(c.want))
+		}
+	}
+}
+
+// TestColdSweepFullWarnsOnce: a sweep that finds cold storage full with
+// nothing it may delete warns once per stuckEvery, not at every sweep.
+func TestColdSweepFullWarnsOnce(t *testing.T) {
+	gib := domain.GiB
+	logs := &lockedBuf{}
+	hot, cold := &fakeDisk{free: 60 * gib, total: 100 * gib}, &fakeDisk{free: 200 * gib, total: 250 * gib}
+	e := newColdEnv(t, hot, cold, func(c *Config, _ *tierStore) {
+		c.Log = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	e.box("p--a", instance("p", "a"), false, true, 6*gib)
+	e.advance(DefaultColdAfter + time.Minute)
+	cold.setFree(gib) // below the 12.5 GiB floor, and nothing on it to delete
+	const full = "cold storage: no room to move unused vms"
+	e.sweepCold()
+	e.advance(time.Minute)
+	e.sweepCold()
+	if n := logs.count(full); n != 1 {
+		t.Fatalf("%d warnings in two sweeps:\n%s", n, logs.b.String())
+	}
+	e.advance(stuckEvery)
+	e.sweepCold()
+	if n := logs.count(full); n != 2 || tierOf(*e.vm("p--a")) != domain.TierHot {
+		t.Fatalf("%d warnings after stuckEvery, p--a %s", n, tierOf(*e.vm("p--a")))
 	}
 }

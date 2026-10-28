@@ -206,6 +206,21 @@ refuses (`stop_required`), names them and says what to run once they are done:
 error: box PROJECT/INSTANCE runs with 2 cpu, 2.0 GiB memory, 8.0 GiB disk; the new shape needs a restart, which would end the 1 process(es) started through davit still running in it (PROCESS). When they are done, run `davit box down PROJECT/INSTANCE` and then `davit box up PROJECT/INSTANCE --memory 4GiB` (stop_required)
 ```
 
+## Box disk full
+
+**What it means.** A write inside the box (a `box up` sync into the workspace, a file upload) failed because
+the box's own disk is full, not the host's:
+
+```text
+error: guest: /home/davit/work: no space left on device; box disk full: `davit box up --disk 40GiB` (resize) or clean the workspace (resource_exhausted)
+```
+
+It exits 8 (`resource_exhausted`, details `resource: boxDisk`) and is not retryable: the same write fails again.
+`davit box run -- df -h /home/davit` shows the box's disk.
+
+**Fix.** Grow the disk with `davit box up --disk 40GiB` ([project-boxes.md](project-boxes.md#resizing-a-box);
+a disk only grows), or delete what the workspace no longer needs (build outputs, caches) with `box run`.
+
 ## Host full
 
 A box that does not fit does not fail at once. The host first stops idle boxes to make room, then the command
@@ -271,7 +286,8 @@ When the wait runs out it fails with `resource_exhausted`, exit 8, and `host dis
 While the disk is below the floor the host frees space by itself: it removes its own garbage, stops idle
 boxes, moves stopped boxes to its cold storage tier if it has one ([storage-tiers.md](storage-tiers.md)), and
 then deletes unused boxes, least recently used first (project images with no instances unused for a day,
-stopped instances unused for 3 days), never a pinned or running one. See what it deleted and why:
+stopped instances unused for 3 days, cold ones for 12 hours; still short, any unused for an hour), never a
+pinned, running or busy one. See what it deleted and why:
 
 ```sh
 davit box ls                          # the host line shows disk free / floor / reserved, then auto-deleted boxes

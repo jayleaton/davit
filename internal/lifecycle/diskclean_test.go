@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -374,9 +375,10 @@ func TestAutoDelete(t *testing.T) {
 	e.busy.Store(busy.ID, true)
 	e.box("plain", nil, false, true, 5*gib)
 	e.advance(4 * 24 * time.Hour)
-	e.box("p--recent", instance("p", "recent"), false, true, 5*gib)
 	e.box("p--running", instance("p", "running"), false, false, 5*gib)
 	e.advance(time.Hour)
+	e.box("p--recent", instance("p", "recent"), false, true, 5*gib) // within PressureDeleteAge
+	e.advance(30 * time.Minute)
 
 	// The floor is 10% of 100 GiB; the target 10 + 2 margin. 3 GiB free:
 	// the image (+5) and then the oldest instance (+5) reach 13.
@@ -653,5 +655,113 @@ func TestPruneKeepsRetiredImages(t *testing.T) {
 	}
 	if _, err := os.Stat(kernel); err != nil {
 		t.Fatal("a retired image's kernel was pruned")
+	}
+}
+
+// TestAutoDeleteUnderPressure: below the floor with nothing old enough,
+// the cleanup waives the instance age down to PressureDeleteAge, least
+// recently used first, and says so in the reason; never a pinned, busy or
+// running box, nor one used within PressureDeleteAge. A request's cleanup
+// above the floor (its own need) never escalates.
+func TestAutoDeleteUnderPressure(t *testing.T) {
+	gib := domain.GiB
+	d := &fakeDisk{free: 100 * gib, total: 100 * gib}
+	e := newDiskEnv(t, d, fake.Options{}, nil)
+	e.box("p--b", instance("p", "b"), false, true, 5*gib)
+	e.box("p--pinned", instance("p", "pinned"), true, true, 5*gib)
+	busy := e.box("p--busy", instance("p", "busy"), false, true, 5*gib)
+	e.busy.Store(busy.ID, true)
+	e.advance(time.Hour)
+	e.box("p--a", instance("p", "a"), false, true, gib)
+	e.box("p--c", instance("p", "c"), false, true, gib)
+	e.box("p--running", instance("p", "running"), false, false, 5*gib)
+	e.advance(2 * time.Hour)
+	e.box("p--recent", instance("p", "recent"), false, true, 5*gib)
+	e.advance(30 * time.Minute)
+
+	// Above the floor (10 GiB) for a request needing 15: no box is old
+	// enough at the usual age and it does not escalate.
+	d.setFree(11 * gib)
+	e.svc.freeDisk(e.ctx, 15*gib, owner)
+	if n := len(e.autoDeletions()); n != 0 {
+		t.Fatalf("a request's cleanup above the floor deleted %d boxes", n)
+	}
+
+	// Below: 3 GiB free, target 12: p--b (oldest, 5), then p--a and p--c
+	// (1 each) leave it at 10, unmet; p--recent would be next but for
+	// PressureDeleteAge.
+	d.setFree(3 * gib)
+	e.svc.freeDisk(e.ctx, 0, "")
+	got := e.autoDeletions()
+	if len(got) != 3 || got[0].Box != "p/b" || d.getFree() != 10*gib {
+		t.Fatalf("pressure deletions (LRU): %+v, free %s", got, domain.HumanBytes(d.getFree()))
+	}
+	for _, g := range got {
+		if !strings.Contains(g.Reason, "under pressure") || !strings.Contains(g.Reason, "the 72h age limit waived") {
+			t.Fatalf("reason: %q", g.Reason)
+		}
+	}
+	for _, n := range []string{"p--pinned", "p--busy", "p--running", "p--recent"} {
+		if e.gone(n) {
+			t.Fatalf("%s was auto-deleted under pressure", n)
+		}
+	}
+}
+
+// lockedBuf is a log sink tests read while the service writes.
+type lockedBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) count(s string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Count(l.b.String(), s)
+}
+
+// TestCleanupStuck: a cleanup that frees nothing is not repeated until
+// the journal changes or stuckEvery passes, and logs what blocks it (at
+// warn, at most every stuckEvery), never a per-minute no-op.
+func TestCleanupStuck(t *testing.T) {
+	gib := domain.GiB
+	logs := &lockedBuf{}
+	d := &fakeDisk{free: 100 * gib, total: 100 * gib}
+	e := newDiskEnv(t, d, fake.Options{}, func(c *Config) {
+		c.Log = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	e.box("p--pinned", instance("p", "pinned"), true, true, 5*gib)
+	e.box("p--running", instance("p", "running"), false, false, 5*gib)
+	e.advance(4 * 24 * time.Hour)
+	d.setFree(3 * gib)
+	const stuck, started = "cleanup freed nothing", "host disk low: cleaning up"
+
+	e.svc.freeDisk(e.ctx, 0, "")
+	if logs.count(stuck) != 1 || logs.count("1 pinned (p--pinned)") != 1 || logs.count("1 running (p--running)") != 1 {
+		t.Fatalf("stuck log:\n%s", logs.b.String())
+	}
+	e.advance(2 * time.Minute)
+	e.svc.freeDisk(e.ctx, 0, "")
+	if logs.count(started) != 1 {
+		t.Fatal("a stuck cleanup ran again within stuckEvery with nothing changed")
+	}
+	// A journal change wakes it, but the log stays quiet.
+	if _, err := e.svc.Update(e.ctx, e.req(""), "p--running", api.UpdateVMRequest{Keep: ptr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.freeDisk(e.ctx, 0, "")
+	if logs.count(stuck) != 1 || logs.count(started) != 1 {
+		t.Fatalf("repeated stuck log within stuckEvery:\n%s", logs.b.String())
+	}
+	e.advance(stuckEvery)
+	e.svc.freeDisk(e.ctx, 0, "")
+	if logs.count(stuck) != 2 {
+		t.Fatalf("no stuck log after stuckEvery:\n%s", logs.b.String())
 	}
 }

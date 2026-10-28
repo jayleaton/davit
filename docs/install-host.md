@@ -6,10 +6,10 @@ stay.
 
 ```sh
 # On the Linux host, as the user who will own the VMs (not root):
-curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc7/install.sh | sh -s -- --host
+curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc8/install.sh | sh -s -- --host
 
 # On your laptop (macOS or Linux):
-curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc7/install.sh | sh -s -- --client
+curl -fsSL https://github.com/jayleaton/davit/releases/download/v0.1.0-rc8/install.sh | sh -s -- --client
 davit connect user@host
 ```
 

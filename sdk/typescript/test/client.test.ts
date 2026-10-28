@@ -129,6 +129,33 @@ describe("requests", () => {
     await assert.rejects(c.rotateToken("tok_1", { overlapSeconds: -1 }), TypeError);
   });
 
+  test("getCIStatus sends limit and returns the jobs as sent", async () => {
+    const NOW = "2026-01-01T00:00:00Z";
+    const done = {
+      id: "ci_2", repo: "acme/app", jobId: 12, runId: 77, job: "test", workflow: "CI", labels: ["self-hosted", "davit"],
+      shape: "medium", state: "done", result: "timedOut", conclusion: "cancelled",
+      error: { code: "timeout", message: "t", retryable: false, requestId: "r" }, runner: "davit-ci-2", runnerId: 31,
+      assignedJobId: 10, vmId: "vm_9", processId: "proc_3", exitCode: 124,
+      queuedAt: NOW, boxReadyAt: NOW, startedAt: NOW, completedAt: NOW, endedAt: NOW,
+    };
+    const queued = { id: "ci_1", repo: "acme/app", jobId: 8, runId: 77, job: "lint", labels: ["davit"], state: "parked", queuedAt: NOW };
+    const status = { enabled: true, maxConcurrentJobs: 2, queued: [queued], running: [], recent: [done] };
+    const t = fake(() => json(200, status));
+    const c = new DavitClient({ transport: t });
+    const got = await c.getCIStatus();
+    await c.getCIStatus({ limit: 5 });
+    assert.deepEqual(t.calls.map((r) => `${r.method} ${r.path}`), ["GET /api/v1/ci/status", "GET /api/v1/ci/status?limit=5"]);
+    assert.match(t.calls[0]!.headers["X-Request-Id"]!, /^req_/);
+    assert.equal(t.calls[0]!.headers["Idempotency-Key"], undefined);
+    assert.deepEqual(got, status);
+    assert.equal(got.queued[0]!.state, "parked"); // open enum: a newer server's state passes through
+    const job = got.recent[0]!;
+    assert.equal(job.result, "timedOut");
+    assert.equal(job.error?.code, "timeout");
+    assert.deepEqual([job.jobId, job.runId, job.runnerId, job.assignedJobId, job.exitCode], [12, 77, 31, 10, 124]);
+    assert.deepEqual([job.vmId, job.processId, job.endedAt], ["vm_9", "proc_3", NOW]);
+  });
+
   test("createToken maps scopes, ttl and the idempotency key", async () => {
     const tok = { id: "tok_1", name: "ci", scopes: [{ vmId: "vm_1", actions: ["exec"] }], createdAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-02T00:00:00Z", secret: "slw_s3cret" };
     const t = fake(() => json(201, tok));

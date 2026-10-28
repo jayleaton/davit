@@ -81,6 +81,8 @@ type Options struct {
 	// Images are the configured guest images; empty means the daemon looks
 	// in <DataDir>/images/manifests.
 	Images []config.ImageSource
+	// CI is the CI runner configuration (CIChecks).
+	CI config.GitHubCI
 }
 
 // FromConfig derives Options from a daemon config.
@@ -99,6 +101,7 @@ func FromConfig(c config.Daemon) Options {
 		TailnetEnabled: c.Tailnet.Enabled, TailnetOwners: len(c.Tailnet.OwnerLogins) + len(c.Tailnet.OwnerTags),
 		NetworkMode: c.Network.Mode, Images: c.Images,
 		TailnetHTTPS: c.Tailnet.HTTPS, TLSCertFile: c.Tailnet.TLSCertFile, TLSKeyFile: c.Tailnet.TLSKeyFile,
+		CI: c.CI.GitHub,
 	}
 }
 
@@ -140,6 +143,7 @@ func Run(ctx context.Context, o Options) Report {
 	r.Checks = append(r.Checks, networkChecks(ctx, o)...)
 	r.Checks = append(r.Checks, tailnetStateCheck(o), tailnetAuthCheck(o), tailnetOwnerCheck(o))
 	r.Checks = append(r.Checks, GatewayChecks(o, time.Now())...)
+	r.Checks = append(r.Checks, CIChecks(o)...)
 	return r
 }
 

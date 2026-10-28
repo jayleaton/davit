@@ -118,18 +118,39 @@ When the hot disk is below its floor, the cleanup goes in this order, cheapest l
 2. idle boxes are stopped (reflink storage only);
 3. **stopped VMs move to cold storage**, least recently used first. Under pressure the age is 10 minutes
    instead of `after`, and the host's busy-ness is ignored;
-4. only then are unused hot boxes auto-deleted. Cold boxes are skipped here: deleting them frees nothing on
-   hot.
+4. only then are unused hot boxes auto-deleted (`autoDelete.instanceMinAge`, `imageMinAge`). Cold boxes are
+   skipped here: deleting them frees nothing on hot;
+5. **under pressure**, when steps 1 to 4 left the hot disk short, the age limits are waived down to **1 hour**:
+   step 3 again, its cold cleanup now deleting cold boxes least recently used first whatever their age, then
+   step 4 for hot boxes unused for at least an hour. "Under pressure" means the hot disk is below its floor; a
+   queued request's own cleanup above the floor never gets here.
 
 While the tier drains (`coldStorage.drain`), step 3 is skipped.
 
-The cold disk has its own floor (`coldStorage.minFreeBytes`, `coldStorage.minFreePercent`). A move never
-takes it below. A move that would first runs the **cold cleanup**: it auto-deletes cold boxes, least recently
-used first, unused for at least `autoDelete.instanceMinAge` (3 days), never a pinned one. Their
-`deleteReason` says `cold storage low`, and each is a `vm.autodeleted` event. So the cold disk fills before
-anything is deleted, and the hot cleanup deletes only what cannot go cold.
+The cold disk has its own floor (`coldStorage.minFreeBytes`, `coldStorage.minFreePercent`: by default the
+larger of 5 GiB and 5%). A move never takes it below. A move that would first runs the **cold cleanup**: it
+auto-deletes cold boxes, least recently used first, unused for at least `autoDelete.coldInstanceMinAge` (12
+hours), until the move fits, and then the move goes ahead. In step 5 the cold cleanup goes on past that age, down
+to boxes unused for an hour. The sweeper also runs it when the cold disk is below its floor. Their
+`deleteReason` says `cold storage low` (and, from step 5, `under pressure` with the age limit it waived), and each
+is a `vm.autodeleted` event. So the cold disk fills before anything is deleted, and the hot cleanup deletes only
+what cannot go cold.
 
-With `autoDelete.enabled: false`, neither cleanup deletes anything.
+Neither cleanup ever deletes a box that is pinned, running or starting, has an operation in progress (a
+resume restoring it from cold included), is being moved between the tiers, holds a session, process or
+prompt lease, is the target of a queued request, or was used within the last hour. With
+`autoDelete.enabled: false`, neither deletes anything.
+
+### When the cleanup is stuck
+
+A cleanup run that frees nothing is not repeated until a box changes (stopped, unpinned, deleted) or 10 minutes
+pass, and it logs one warning, at most every 10 minutes while it stays stuck, naming what blocks it:
+
+```text
+WARN host disk low: cleanup freed nothing; retrying when a box changes, or in 10m freeBytes=… blockedBy="cold storage full: 7.9 GiB to move, 13.0 GiB free, floor 12.5 GiB, and no cold box may be deleted; 3 pinned (proj/a, proj/b, proj/c); 2 running (…); 1 used in the last 1h (…)"
+```
+
+Unpin (`box unpin`), stop or remove what it names, or add room.
 
 ### Pin and pin hot
 
@@ -159,7 +180,7 @@ a change, restart the daemon: `systemctl --user restart davit`.
 | `bytesPerSecond` | bytes per second | `104857600` (100 MiB/s) | Caps a move's reads: the copy, then the read-back that verifies it. Negative: unlimited. Restores are not capped. |
 | `minBytes` | bytes | `536870912` (512 MiB) | The least data of its own a VM's disk must hold to move. Negative: any. |
 | `minFreeBytes` | bytes | `5368709120` (5 GiB) | With `minFreePercent`, the cold disk's floor: the larger of the two. Negative: no floor. |
-| `minFreePercent` | percent of the cold filesystem | `10` | At most 90. Negative: bytes only. |
+| `minFreePercent` | percent of the cold filesystem | `5` | At most 90. Negative: bytes only. |
 | `ioBusyPercent` | percent | `20` | Moves wait while PSI I/O "some avg10" is above this. Negative: never wait. |
 | `drain` | boolean | `false` | Move nothing more to cold storage, and bring every cold VM back to hot, one at a time, without booting it ([below](#removing-it)). |
 
@@ -170,7 +191,9 @@ Why the defaults:
 - **`bytesPerSecond` 100 MiB/s.** Below the sequential rate of most current hard disks, so the guests' own
   I/O keeps the disks' attention.
 - **`minBytes` 512 MiB.** A smaller box would free almost nothing on hot.
-- **Floor 5 GiB or 10%.** The same rule as the hot disk's floor.
+- **Floor 5 GiB or 5%.** The hot disk's rule (larger of bytes and a percentage, the same two keys) at half the
+  percentage: a cold disk is many times larger, and 10% of a 250 GiB disk (25 GiB) is three moves' worth left
+  idle.
 
 ### Related keys
 
@@ -183,7 +206,8 @@ These existing keys guard the hot disk ([vm-host.md](vm-host.md#disk-space-floor
 | `limits.diskHeadroomPercent` | `25` | What admission reserves for a starting VM's growth, as a share of its disk size: 2 GiB for an 8 GiB disk. |
 | `limits.saveReserveBytes` | `2147483648` (2 GiB) | The preallocated file in the data dir that stops can use. Negative: none. |
 | `autoDelete.enabled` | `true` | Off: neither cleanup deletes boxes. |
-| `autoDelete.instanceMinAge` | `"72h"` | How long a stopped instance must be unused before it may be auto-deleted, on hot or cold. |
+| `autoDelete.instanceMinAge` | `"72h"` | How long a stopped instance on hot must be unused before it may be auto-deleted. |
+| `autoDelete.coldInstanceMinAge` | `"12h"` | The same for an instance on cold, which the cold cleanup deletes to make room for the next move. |
 | `autoDelete.imageMinAge` | `"24h"` | The same for a project image with no instances. |
 | `autoDelete.marginBytes` | `2147483648` (2 GiB) | How far above a floor a cleanup frees before it stops. |
 | `autoDelete.blobMinAge` | `"1h"` | How long an unreferenced image blob must be unchanged before it is removed. |
@@ -208,6 +232,7 @@ These existing keys guard the hot disk ([vm-host.md](vm-host.md#disk-space-floor
   "autoDelete": {
     "enabled": true,
     "instanceMinAge": "72h",
+    "coldInstanceMinAge": "12h",
     "imageMinAge": "24h",
     "marginBytes": 2147483648,
     "blobMinAge": "1h"
@@ -218,7 +243,7 @@ These existing keys guard the hot disk ([vm-host.md](vm-host.md#disk-space-floor
     "bytesPerSecond": 104857600,
     "minBytes": 536870912,
     "minFreeBytes": 5368709120,
-    "minFreePercent": 10,
+    "minFreePercent": 5,
     "ioBusyPercent": 20,
     "drain": false
   },
@@ -300,8 +325,8 @@ The same shape on real hardware: the data dir on the NVMe, the hard disk formatt
 }
 ```
 
-- **Sizing:** the cold disk is usually many times the NVMe. With the default floor (10%), a 2 TB disk keeps
-  about 186 GiB free.
+- **Sizing:** the cold disk is usually many times the NVMe. With the default cold floor (5%), a 2 TB disk keeps
+  about 93 GiB free.
 - **Trade-off:** moves are slow but paced and in the idle I/O class. Set the HDD's scheduler to BFQ for the
   idle class to work: `echo bfq | sudo tee /sys/block/sdX/queue/scheduler` (persist it with a udev rule).
 - With nothing else on the HDD, `ioBusyPercent` can stay at the default. If other services use it, lower
@@ -505,15 +530,16 @@ Cold, 250 GiB:
 
 | | GiB |
 | --- | --- |
-| floor: max(5 GiB, 10% of 250 GiB) | 25 |
-| **left for cold boxes** | **225** |
+| floor: max(5 GiB, 5% of 250 GiB) | 12.5 |
+| **left for cold boxes** | **237.5** |
 | one cold box: 3 GiB image data plus 1–3 GiB own data | 4–6 |
 
-225 / 6 ≈ 37 and 225 / 4 ≈ 56: about 37–56 cold boxes, fewer if they also have named snapshots.
+237.5 / 6 ≈ 39 and 237.5 / 4 ≈ 59: about 39–59 cold boxes, fewer if they also have named snapshots.
 
 Without the cold tier the same 52 GiB would hold every box the host keeps: about 26. With it, about 26 recent
 boxes stay hot and about 40 more wait on the HDD. When the HDD fills, its oldest unpinned boxes (unused for
-3 days or more) are auto-deleted first.
+12 hours or more; with the hot disk below its floor and nothing else to free, for an hour or more) are
+auto-deleted to make room for the next move.
 
 ## Operations
 

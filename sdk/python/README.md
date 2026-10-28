@@ -699,6 +699,32 @@ sw.revoke_token(tok)  # or the ID; a second revoke raises NotFound
   the request still needs a tailnet identity and runs as the token's issuer
   limited to its scopes. The local socket ignores tokens.
 
+## CI runners
+
+When the daemon runs GitHub Actions jobs (`ci.github`, one fresh box per job;
+see [docs/ci-runners.md](../../docs/ci-runners.md)), the host owner can read
+their state, like `davit ci status`. Other callers get `PermissionDenied`.
+
+```python
+st = sw.get_ci_status(limit=50)  # CIStatus
+if st.enabled:
+    for job in st.queued + st.running + st.recent:
+        print(job.repo, job.job, job.state, job.result, job.vm_id, job.process_id)
+```
+
+- `get_ci_status(limit=None)` returns a `CIStatus`: `enabled` (false when
+  `ci.github` is off; the lists are then empty), `max_concurrent_jobs`,
+  `queued` (FIFO order), `running` (starting, running, stopping) and `recent`
+  (done and refused, newest first, at most `limit`: 1..200, server default 20).
+- Each `CIJob` names the GitHub job (`repo`, `job_id`, `run_id`, `job`,
+  `workflow`, `labels`) and its runner box (`shape`, `runner`, `runner_id`,
+  `vm_id`, `process_id`: the runner's output is in the VM's process history).
+  `state` and `result` (`succeeded`, `failed`, `cancelled`, `timedOut`,
+  `refused`) are open enums; `conclusion` is GitHub's own result once known,
+  `error` why a job failed or was refused, and `assigned_job_id` the job GitHub
+  gave the runner when it is not `job_id`. Timestamps: `queued_at`,
+  `box_ready_at`, `started_at`, `completed_at`, `ended_at` (the box is gone).
+
 ## Events and webhooks
 
 The host event stream (`vm.created`, `vm.state`, `operation.*`, `run.*`,

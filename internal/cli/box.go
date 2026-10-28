@@ -229,6 +229,9 @@ func boxHint(err error) error {
 	}
 	switch ce.Code {
 	case domain.CodeResourceExhausted:
+		if ce.Details["resource"] == domain.ResourceBoxDisk {
+			break // the box's own disk: its message says what to do
+		}
 		ce.Message += "; the host is full: free capacity with `" + buildinfo.Name + " box ls` then `" + buildinfo.Name +
 			" box down PROJECT/INSTANCE` (or `box rm`), ask for less with --cpus/--memory/--disk, or queue longer with --wait 10m"
 	case domain.CodeUnavailable:

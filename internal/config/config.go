@@ -92,6 +92,8 @@ type Daemon struct {
 	Tailnet     Tailnet          `json:"tailnet"`
 	Harness     Harness          `json:"harness"`
 	Telemetry   Telemetry        `json:"telemetry"`
+	// CI runs CI jobs in fresh boxes (docs/ci-runners.md); off by default.
+	CI CI `json:"ci,omitempty"`
 	// LogLevel is debug, info, warn or error.
 	LogLevel string `json:"logLevel"`
 	// ReleaseBaseURL is a release directory `davit version --check` reads
@@ -108,9 +110,14 @@ type AutoDelete struct {
 	Enabled *bool `json:"enabled,omitempty"`
 	// InstanceMinAge and ImageMinAge are how long a stopped box instance,
 	// or a project image without instances, must have been unused before
-	// it may be deleted (default 72h and 24h).
-	InstanceMinAge Duration `json:"instanceMinAge,omitempty"`
-	ImageMinAge    Duration `json:"imageMinAge,omitempty"`
+	// it may be deleted (default 72h and 24h). ColdInstanceMinAge is the
+	// same for an instance on the cold storage tier, which the cold
+	// cleanup deletes to make room for the next move (default 12h). With
+	// the host disk below its floor and nothing else to free, the cleanup
+	// waives these down to 1h (docs/storage-tiers.md).
+	InstanceMinAge     Duration `json:"instanceMinAge,omitempty"`
+	ImageMinAge        Duration `json:"imageMinAge,omitempty"`
+	ColdInstanceMinAge Duration `json:"coldInstanceMinAge,omitempty"`
 	// MarginBytes is how far above the floor the cleanup frees before it
 	// stops (default 2 GiB).
 	MarginBytes int64 `json:"marginBytes,omitempty"`
@@ -135,7 +142,7 @@ type ColdStorage struct {
 	// (default 512 MiB; negative: any).
 	MinBytes int64 `json:"minBytes,omitempty"`
 	// MinFreeBytes and MinFreePercent are the cold filesystem's floor, the
-	// larger of the two (default 5 GiB and 10%; minFreeBytes negative: no
+	// larger of the two (default 5 GiB and 5%; minFreeBytes negative: no
 	// floor). Moves never take it below; under it, unused cold boxes are
 	// auto-deleted.
 	MinFreeBytes   int64 `json:"minFreeBytes,omitempty"`
@@ -482,8 +489,9 @@ func (c Daemon) Validate() error {
 		return fmt.Errorf("config: limits.minFreeDiskPercent must be at most 90 (0: the default, %d; negative: bytes only)", domain.DefaultMinFreeDiskPercent)
 	case c.Limits.DiskHeadroomPercent > 100:
 		return fmt.Errorf("config: limits.diskHeadroomPercent must be at most 100 (0: the default, %d; negative: none)", domain.DefaultDiskHeadroomPercent)
-	case c.AutoDelete.InstanceMinAge < 0 || c.AutoDelete.ImageMinAge < 0 || c.AutoDelete.MarginBytes < 0 || c.AutoDelete.BlobMinAge < 0:
-		return fmt.Errorf("config: autoDelete.instanceMinAge, imageMinAge, marginBytes and blobMinAge must not be negative (0: the defaults)")
+	case c.AutoDelete.InstanceMinAge < 0 || c.AutoDelete.ImageMinAge < 0 || c.AutoDelete.ColdInstanceMinAge < 0 ||
+		c.AutoDelete.MarginBytes < 0 || c.AutoDelete.BlobMinAge < 0:
+		return fmt.Errorf("config: autoDelete.instanceMinAge, imageMinAge, coldInstanceMinAge, marginBytes and blobMinAge must not be negative (0: the defaults)")
 	case c.ColdStorage.Dir != "" && !filepath.IsAbs(c.ColdStorage.Dir):
 		return fmt.Errorf("config: coldStorage.dir must be an absolute path")
 	case c.ColdStorage.Dir != "" && (within(c.ColdStorage.Dir, c.DataDir) || within(c.DataDir, c.ColdStorage.Dir)):
@@ -491,7 +499,7 @@ func (c Daemon) Validate() error {
 	case c.ColdStorage.After < 0:
 		return fmt.Errorf("config: coldStorage.after must not be negative (0: the default, 6h)")
 	case c.ColdStorage.MinFreePercent > 90:
-		return fmt.Errorf("config: coldStorage.minFreePercent must be at most 90 (0: the default, %d; negative: bytes only)", domain.DefaultMinFreeDiskPercent)
+		return fmt.Errorf("config: coldStorage.minFreePercent must be at most 90 (0: the default, 5; negative: bytes only)")
 	case c.ColdStorage.Dir == "" && (c.ColdStorage.After != 0 || c.ColdStorage.Drain || c.ColdStorage.BytesPerSecond != 0 ||
 		c.ColdStorage.MinBytes != 0 || c.ColdStorage.MinFreeBytes != 0 || c.ColdStorage.MinFreePercent != 0 || c.ColdStorage.IOBusyPercent != 0):
 		return fmt.Errorf("config: coldStorage settings need coldStorage.dir")
@@ -530,7 +538,7 @@ func (c Daemon) Validate() error {
 			return fmt.Errorf("config: images entries need absolute manifest and blobDir paths")
 		}
 	}
-	return nil
+	return c.CI.Validate()
 }
 
 func home() string {

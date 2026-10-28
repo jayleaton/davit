@@ -5,8 +5,10 @@
 # guest agent's $WORK/agent-<arch>.env (build-agent.sh).
 #
 # Image recipes live in rootfs/<IMAGE>/. A derived image has a `base` file naming its parent
-# recipe: the parent provisions as usual and the derived directory runs as its layer (layer.sh,
-# before sealing); an optional stage.sh in it stages verified downloads host-side first.
+# recipe, which may be derived too (a chain such as ci -> dev -> base): the root recipe provisions
+# as usual and every derived one, root first, runs as a layer (its packages.txt from the snapshot,
+# then its layer.sh, before sealing); an optional stage.sh in each stages verified downloads
+# host-side first.
 # The rootfs arch must match the host (apt runs natively inside the chroot, no qemu-user).
 #
 # Steps, all inside one user namespace (fake root via /etc/subuid, no sudo):
@@ -20,8 +22,6 @@ set_arch
 IMAGE=${IMAGE:-ubuntu-24.04-base}
 SIZE=${SIZE:-4G}
 DEF=$IMAGES_DIR/rootfs/$IMAGE
-BASE_DEF=$DEF
-[[ -f $DEF/base ]] && BASE_DEF=$IMAGES_DIR/rootfs/$(cat "$DEF/base")
 RWORK=$WORK/rootfs-$IMAGE-$DEB_ARCH
 
 inner() {
@@ -32,18 +32,35 @@ inner() {
   chroot_mount "$r"
   mkdir -p "$r/.provision"
   cp -r "$BASE_DEF/." "$r/.provision/"
-  if [[ $DEF != "$BASE_DEF" ]]; then
-    cp -r "$DEF/." "$r/.provision/layer/"
-    if [[ -d $RWORK/stage ]]; then cp -r "$RWORK/stage" "$r/.provision/layer/stage"; fi
-  fi
+  # Layers in /.provision/layers/<n>-<recipe>, numbered root first; provision.sh runs each one
+  # as /.provision/layer.
+  local layers=() n=0 l d
+  read -ra layers <<<"$CHAIN"
+  for l in "${layers[@]:1}"; do
+    n=$((n + 1))
+    d=$r/.provision/layers/$(printf %02d "$n")-$l
+    mkdir -p "$d"
+    cp -r "$IMAGES_DIR/rootfs/$l/." "$d/"
+    if [[ -d $RWORK/stage/$l ]]; then cp -r "$RWORK/stage/$l" "$d/stage"; fi
+  done
   cp "$DL/docker.asc" "$r/.provision/docker.asc"
   cp "$RWORK/modules-builtin.tar" "$r/.provision/modules-builtin.tar"
   cp "$RWORK/davit-guest-agent" "$r/.provision/davit-guest-agent"
+  if [[ -n $APT_CACHE ]]; then
+    apt_cache_seed "$r" "$DEB_ARCH"
+    # provision.sh hands what apt fetched back here before the seal empties it.
+    mkdir -p "$r/.provision/apt-cache/archives" "$r/.provision/apt-cache/lists" "$r/.provision/apt-cache/markers"
+    cp "$IMAGES_DIR/inputs.lock" "$r/.provision/apt-cache/inputs.lock"
+  fi
   local env=(PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 TZ=UTC DEB_ARCH="$DEB_ARCH"
     AGENT_VERSION="$AGENT_VERSION") k
   while read -r k; do env+=("$k=${!k}"); done < <(sed -nE 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$IMAGES_DIR/inputs.lock")
   chroot "$r" /usr/bin/env -i "${env[@]}" /bin/bash /.provision/provision.sh
   mv "$r/.provision/packages.lock" "$RWORK/packages.lock"
+  if [[ -n $APT_CACHE ]]; then
+    apt_cache_harvest "$r/.provision/apt-cache/archives" "$r/.provision/apt-cache/lists" \
+      "$r/.provision/apt-cache/markers" "$DEB_ARCH"
+  fi
   rm -rf "$r/.provision"
   chroot_umount "$r"
   # Guard: the build borrows the host's resolv.conf; its search domains must not reach the image
@@ -76,6 +93,8 @@ case ${1:-} in
 esac
 
 [[ -d $DEF ]] || die "unknown IMAGE=$IMAGE (no $DEF)"
+CHAIN=$(python3 -I "$IMAGES_DIR/scripts/make-manifest.py" --chain "$IMAGE")
+BASE_DEF=$IMAGES_DIR/rootfs/${CHAIN%% *}
 [[ -f $BASE_DEF/provision.sh ]] || die "$IMAGE: base recipe $BASE_DEF has no provision.sh"
 [[ $DEB_ARCH == "$HOST_DEB_ARCH" ]] || die "rootfs arch $DEB_ARCH must match host $HOST_DEB_ARCH"
 [[ -f $WORK/kernel-$ARCH.env ]] || die "build the kernel first (scripts/build-kernel.sh)"
@@ -98,19 +117,21 @@ gpg --show-keys --with-colons "$DL/docker.asc" 2>/dev/null | grep -q "^fpr::::::
 # Filesystem UUID/hash seed derived from the image name + inputs: stable, but distinct per image.
 FS_UUID=$(cat "$IMAGES_DIR/inputs.lock" <(echo "$IMAGE $DEB_ARCH $SIZE") | sha256sum \
   | sed -E 's/^(.{8})(.{4}).(.{3}).(.{3})(.{12}).*/\1-\2-4\3-8\4-\5/')
-export IMAGE SIZE DEF BASE_DEF RWORK FS_UUID AGENT_VERSION
+export IMAGE SIZE DEF BASE_DEF CHAIN RWORK FS_UUID AGENT_VERSION
 
 rm_tree "$RWORK"
 mkdir -p "$RWORK"
 cp "$OUT/blobs/sha256/$KERNEL_MODULES_BLOB" "$RWORK/modules-builtin.tar"
 cp "$OUT/blobs/sha256/$AGENT_BLOB" "$RWORK/davit-guest-agent"
-if [[ -f $DEF/stage.sh ]]; then
-  STAGE=$RWORK/stage
+read -ra chain <<<"$CHAIN"
+for l in "${chain[@]:1}"; do
+  [[ -f $IMAGES_DIR/rootfs/$l/stage.sh ]] || continue
+  STAGE=$RWORK/stage/$l
   mkdir -p "$STAGE"
-  # shellcheck disable=SC1091 # per-image recipe hook
-  source "$DEF/stage.sh"
-fi
-log "rootfs: building $IMAGE ($DEB_ARCH, $SIZE) from snapshot $UBUNTU_SNAPSHOT"
+  # shellcheck disable=SC1090 # per-image recipe hook
+  source "$IMAGES_DIR/rootfs/$l/stage.sh"
+done
+log "rootfs: building $IMAGE ($DEB_ARCH, $SIZE) from snapshot $UBUNTU_SNAPSHOT (recipes: $CHAIN)"
 in_userns "$0" __inner
 
 {

@@ -49,6 +49,8 @@ from davit import (
 from davit.client import _run_exit
 from davit.errors import ERROR_CLASSES, OperationInProgress
 from davit.models import (
+    CIJobResult,
+    CIJobState,
     CredentialKind,
     GrantState,
     OutputNotRetainedReason,
@@ -1609,3 +1611,73 @@ def test_whoami_and_rotate_token(make_client: Any) -> None:
     client.rotate_token("tok_1")
     assert json.loads(seen[2].content) == {}
     assert "Idempotency-Key" in seen[2].headers
+
+
+def test_get_ci_status_pages_recent_and_decodes_jobs(make_client: Any) -> None:
+    done = {
+        "id": "ci_2",
+        "repo": "acme/app",
+        "jobId": 9007199254740993,
+        "runId": 77,
+        "job": "test",
+        "workflow": "CI",
+        "labels": ["self-hosted", "davit"],
+        "shape": "medium",
+        "state": "done",
+        "result": "timedOut",
+        "conclusion": "cancelled",
+        "error": {"code": "timeout", "message": "t", "retryable": False, "requestId": "r"},
+        "runner": "davit-ci-2",
+        "runnerId": 31,
+        "assignedJobId": 10,
+        "vmId": "vm_9",
+        "processId": "proc_3",
+        "exitCode": 124,
+        "queuedAt": NOW,
+        "boxReadyAt": NOW,
+        "startedAt": NOW,
+        "completedAt": NOW,
+        "endedAt": NOW,
+        "future": True,
+    }
+    queued = {
+        "id": "ci_1",
+        "repo": "acme/app",
+        "jobId": 8,
+        "runId": 77,
+        "job": "lint",
+        "labels": ["davit"],
+        "state": "parked",
+        "queuedAt": NOW,
+    }
+    status = {
+        "enabled": True,
+        "maxConcurrentJobs": 2,
+        "queued": [queued],
+        "running": [],
+        "recent": [done],
+    }
+    client, seen = make_client(lambda r: httpx.Response(200, json=status))
+    got = client.get_ci_status()
+    client.get_ci_status(limit=5)
+    assert [(r.method, r.url.path) for r in seen] == [("GET", "/api/v1/ci/status")] * 2
+    assert "limit" not in seen[0].url.params and seen[1].url.params["limit"] == "5"
+    assert got.enabled and got.max_concurrent_jobs == 2 and got.running == []
+    q = got.queued[0]
+    assert q.state == "parked" and q.result is None and q.workflow is None and q.exit_code is None
+    job = got.recent[0]
+    assert (job.id, job.repo, job.job_id, job.run_id, job.job, job.workflow) == (
+        "ci_2",
+        "acme/app",
+        9007199254740993,
+        77,
+        "test",
+        "CI",
+    )
+    assert job.labels == ["self-hosted", "davit"] and job.shape == "medium"
+    assert job.state == CIJobState.DONE and job.result == CIJobResult.TIMEDOUT
+    assert job.conclusion == "cancelled" and job.error is not None and job.error.code == "timeout"
+    assert (job.runner, job.runner_id, job.assigned_job_id) == ("davit-ci-2", 31, 10)
+    assert (job.vm_id, job.process_id, job.exit_code) == ("vm_9", "proc_3", 124)
+    assert job.queued_at.tzinfo is not None and job.ended_at == job.queued_at
+    assert job.box_ready_at and job.started_at and job.completed_at

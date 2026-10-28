@@ -18,7 +18,8 @@
 #   $SVM_DIR/runs/RUN  payload, out/ (logs for the caller), t/ (TMPDIR)
 #   $SVM_FS/blobs      image blobs (sha256/<hex>), unpacked by --prepare or built by images
 #   $SVM_FS/manifests  the base manifest images built here; when present, prepare and run use
-#                      it instead of the committed one (its blobs are the ones built here)
+#                      it instead of the committed one (its blobs are the ones built here). A
+#                      ubuntu-24.04-ci manifest built here is DAVIT_TEST_CI_IMAGE_MANIFEST
 #   $SVM_FS/images-work images/build.sh scratch (DAVIT_IMAGES_WORK)
 #   $SVM_FS/scratch    DAVIT_TEST_SCRATCH: pinned Firecracker and the derived
 #                      image persist; everything else is removed after a run
@@ -32,6 +33,7 @@ BLOBS=$SVM_FS/blobs
 SRC=$SVM_DIR/src
 MANIFEST=images/manifests/ubuntu-24.04-base.json
 BUILT=$SVM_FS/manifests/ubuntu-24.04-base.json
+CI_BUILT=$SVM_FS/manifests/ubuntu-24.04-ci.json
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # manifest: the base manifest the tier uses (absolute).
@@ -116,6 +118,8 @@ goenv() {
 	DAVIT_TEST_IMAGE_MANIFEST=$(manifest)
 	export DAVIT_TEST_IMAGE_MANIFEST
 	export DAVIT_TEST_IMAGE_BLOBS=$BLOBS
+	# The GitHub Actions runner image, when --images built it here (its blobs are in $BLOBS too).
+	if [ -f "$CI_BUILT" ]; then export DAVIT_TEST_CI_IMAGE_MANIFEST=$CI_BUILT; fi
 	export DAVIT_TEST_SCRATCH=$SCRATCH
 	MISE=$mise
 }
@@ -146,7 +150,7 @@ prepare() {
 			rm -f "$f" # so the next --prepare sends it again
 			bad=1
 		fi
-	done < <(grep -oE 'sha256:[0-9a-f]{64}' "$(manifest)" | sort -u)
+	done < <(grep -ohE 'sha256:[0-9a-f]{64}' "$(manifest)" ${DAVIT_TEST_CI_IMAGE_MANIFEST:+"$DAVIT_TEST_CI_IMAGE_MANIFEST"} | sort -u)
 	[ "$bad" = 0 ] || die "corrupt blobs removed; rerun vm-tier.sh --prepare"
 	check || die "host requirements unmet (above)"
 	say "warming the fixture: pinned Firecracker, agent, derived image (no VM boots)"

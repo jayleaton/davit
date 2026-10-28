@@ -95,6 +95,10 @@ either SDK only together with the other, and record any new shared rule here.
   of the `PutCredentialRequest` `repr`. `listCredentialGrants` returns one page (the server sends
   all of a VM's grants); `revokeCredentialGrant` returns the revoked grant. The guest sees only the
   grant's `placeholder` in `envVar` and calls the host proxy at `http://172.16.0.1:15080`.
+- **CI runners.** `getCIStatus(limit?)` is owner-only and read-only (no `Idempotency-Key`):
+  `CIStatus` with `queued` (FIFO), `running` and `recent` (newest first, at most `limit`, 1..200,
+  server default 20) `CIJob`s; `enabled` is false and the lists empty when `ci.github` is off.
+  `limit` is passed through unvalidated, as on the paged lists.
 - **Events and webhooks.** `listEvents` pages the host event stream (`types` filter of types or
   `prefix.`, `vmId`, `start` oldest/latest, `waitMs` long-poll ≤ 30 s; `nextCursor` always set);
   `iterEvents` follows it and stops at the first empty page, or with `follow` long-polls (25 s per

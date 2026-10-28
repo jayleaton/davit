@@ -203,19 +203,26 @@ type Service struct {
 	// lastGarbage, when it last collected garbage.
 	cleanMu     sync.Mutex
 	lastGarbage time.Time
-	// fruitless is the journal's change channel when a cleanup last freed
-	// nothing (at fruitlessAt); the next waits for it to close (cleanMu).
-	fruitless   <-chan struct{}
-	fruitlessAt time.Time
+	// fruitless is the journal's change channel when a cleanup (for
+	// fruitlessOwner's boxes, or "" all) last freed nothing, at
+	// fruitlessAt; the next waits for it to close. stuckLogAt is when a
+	// stuck cleanup last logged what blocks it (cleanMu).
+	fruitless      <-chan struct{}
+	fruitlessAt    time.Time
+	fruitlessOwner domain.PrincipalID
+	stuckLogAt     time.Time
 	// saving counts stops in flight, which may be using the released save
 	// reserve (diskreserve.go).
 	saving int
 	// demoteMu runs one move to cold storage at a time and coldMu one cold
 	// sweep (coldtier.go); demoting cancels the move of a VM in flight and
-	// coldSkip holds the revision at which a VM measured too small to move.
+	// coldSkip holds the revision at which a VM measured too small to move;
+	// coldFullAt is when the sweep last warned that cold storage is full
+	// (coldMu).
 	demoteMu, coldMu sync.Mutex
 	demoting         map[domain.VMID]context.CancelFunc
 	coldSkip         map[domain.VMID]int64
+	coldFullAt       time.Time
 }
 
 // New validates cfg and returns a service. Call Start before serving.

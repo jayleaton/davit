@@ -35,7 +35,8 @@ var boxSubs = []boxSub{
 	{"ls", "[PROJECT] [--deleted]", "list boxes and project images (and whether each is on hot or cold storage), with the host's free memory and disk; --deleted: the boxes the host auto-deleted for disk space",
 		[]string{"deleted"}},
 	{"pin", "[PROJECT[/INSTANCE] | PROJECT/image] [--hot]", "keep the box (or project image) when the host is low on disk: unused boxes older than " +
-		"3 days (images without instances: 1 day; the host's defaults) can be auto-deleted then; pin to keep. --hot also keeps it on " +
+		"3 days (on cold storage 12 hours, images without instances 1 day: the host's defaults; with the disk still short, 1 hour) " +
+		"can be auto-deleted then; pin to keep. --hot also keeps it on " +
 		"hot storage: a host with a cold storage tier never moves it there", []string{"hot"}},
 	{"unpin", "[PROJECT[/INSTANCE] | PROJECT/image]", "undo box pin (and --hot)", nil},
 	{"rm", "[PROJECT[/INSTANCE]] --yes", "delete the box and its disk", []string{"yes"}},

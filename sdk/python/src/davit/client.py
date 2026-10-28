@@ -40,6 +40,7 @@ from .models import (
     AddMemberRequest,
     AppEndpoint,
     AppEndpointList,
+    CIStatus,
     Conversation,
     ConversationList,
     CreateAppEndpointRequest,
@@ -287,6 +288,7 @@ OPERATIONS: dict[str, tuple[str, str]] = {
     "rotateWebhookSecret": ("POST", "/webhooks/{webhookId}/rotate-secret"),
     "listWebhookDeliveries": ("GET", "/webhooks/{webhookId}/deliveries"),
     "retryWebhookDelivery": ("POST", "/webhooks/{webhookId}/deliveries/{deliveryId}/retry"),
+    "getCIStatus": ("GET", "/ci/status"),
 }
 """operationId → (HTTP method, path template under ``/api/v1``) this client calls."""
 
@@ -3132,6 +3134,24 @@ class Client:
             {"environmentId": environment, "revision": str(revision)},
         )
         return _decode(EnvironmentRevision, data)
+
+    # ---- CI runners ---------------------------------------------------------
+
+    def get_ci_status(self, *, limit: int | None = None) -> CIStatus:
+        """The host's GitHub Actions runner jobs (``getCIStatus``), owner only.
+
+        ``queued`` is in FIFO order, ``running`` holds the starting, running
+        and stopping jobs, and ``recent`` the done and refused ones, newest
+        first. ``enabled`` is false (and the lists empty) when ``ci.github``
+        is off.
+
+        Args:
+            limit: At most this many ``recent`` jobs (1..200; server default 20).
+
+        Raises:
+            PermissionDenied: The caller is not the owner identity.
+        """
+        return _decode(CIStatus, self._call("getCIStatus", params=self._page_params(limit, None)))
 
     # ---- events and webhooks ------------------------------------------------
 
