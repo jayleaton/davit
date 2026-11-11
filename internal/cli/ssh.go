@@ -295,10 +295,20 @@ func (s *session) openSSHOptions(ctx context.Context, vmID domain.VMID, user str
 	if err != nil {
 		return nil, "", err
 	}
-	return []string{"-o", "ProxyCommand=" + pc,
-		"-o", "UserKnownHostsFile=" + f.knownHosts, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=yes",
-		"-o", "IdentityFile=" + f.key, "-o", "CertificateFile=" + f.cert, "-o", "IdentitiesOnly=yes",
-		"-o", "User=" + user}, host, nil
+	return openSSHArgs(pc, f, user), host, nil
+}
+
+// openSSHArgs are the OpenSSH options (before the host name) that reach a VM
+// with the key, certificate and pinned host keys in f. The identity file goes
+// through -i as its own argv element: ssh's -o parser splits a one-argument
+// keyword value on whitespace, and on macOS the key lives under
+// "~/Library/Application Support" (a space). The options without a short form
+// quote the path inside their value.
+func openSSHArgs(proxyCommand string, f sshFiles, user string) []string {
+	return []string{"-o", "ProxyCommand=" + proxyCommand,
+		"-o", "UserKnownHostsFile=" + sshConfigQuote(f.knownHosts), "-o", "GlobalKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=yes",
+		"-i", f.key, "-o", "CertificateFile=" + sshConfigQuote(f.cert), "-o", "IdentitiesOnly=yes",
+		"-o", "User=" + user}
 }
 
 // runOpenSSH runs an OpenSSH client with this terminal and returns its exit
@@ -422,12 +432,14 @@ Match host %[2]s* exec "%[4]s"
 // %-tokens.
 func sshConfigPath(p string) string { return strings.ReplaceAll(p, "%", "%%") }
 
-// sshConfigQuote double-quotes an ssh_config argument containing spaces.
+// sshConfigQuote double-quotes an ssh_config argument, escaping backslashes
+// and double quotes inside it (backslash first) so a path with whitespace, a
+// quote or a backslash stays one value. ssh_config expands %-tokens after
+// unquoting, so an intentional %C in a ControlPath is preserved.
 func sshConfigQuote(s string) string {
-	if strings.ContainsAny(s, " \t") {
-		return `"` + s + `"`
-	}
-	return s
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }
 
 // remotePathRE matches the VM side of an scp argument: VM:path.

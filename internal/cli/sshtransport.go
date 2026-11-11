@@ -157,7 +157,7 @@ func sshDialer(u *url.URL) (func(ctx context.Context) (net.Conn, error), error) 
 	}
 	args := t.args()
 	if dir, err := controlDir(); err == nil {
-		args = append(args, "-o", "ControlMaster=auto", "-o", "ControlPath="+filepath.Join(dir, "%C"), "-o", "ControlPersist=120")
+		args = append(args, "-o", "ControlMaster=auto", "-o", "ControlPath="+sshConfigQuote(filepath.Join(dir, "%C")), "-o", "ControlPersist=120")
 	}
 	remote := []string{"dial-stdio"}
 	if t.socket != "" {
