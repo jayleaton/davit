@@ -88,10 +88,10 @@ func TestSSHEndToEnd(t *testing.T) {
 	}
 	_, errOut, code = run("ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
 		"-o", "ProxyCommand="+bin+" ssh --proxy "+string(other.ID),
-		"-o", "UserKnownHostsFile="+filepath.Join(sshDir, "davit-"+string(other.ID)+".known_hosts"),
+		"-o", `UserKnownHostsFile="`+filepath.Join(sshDir, "davit-"+string(other.ID)+".known_hosts")+`"`,
 		"-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
-		"-o", "IdentityFile="+filepath.Join(sshDir, "id_ed25519"),
-		"-o", "CertificateFile="+filepath.Join(sshDir, "davit-"+string(vm.ID)+"-cert.pub"),
+		"-i", filepath.Join(sshDir, "id_ed25519"),
+		"-o", `CertificateFile="`+filepath.Join(sshDir, "davit-"+string(vm.ID)+"-cert.pub")+`"`,
 		"user@davit-"+string(other.ID), "true")
 	if code == 0 || !strings.Contains(errOut, "Permission denied") {
 		t.Fatalf("box's certificate on box2: exit %d stderr %q", code, errOut)
@@ -112,6 +112,28 @@ func TestSSHEndToEnd(t *testing.T) {
 
 	if r := h.cli("ssh", "box"); r.code != cli.ExitUsage {
 		t.Fatalf("ssh --json must be refused, got exit %d", r.code)
+	}
+}
+
+// TestSSHKeyPathWithSpace puts the CLI's SSH key under a directory whose name
+// contains a space, as the macOS client does ("~/Library/Application
+// Support/davit/ssh"), and checks that the real OpenSSH client can use it.
+func TestSSHKeyPathWithSpace(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("no OpenSSH client in PATH")
+	}
+	h := newHost(t)
+	h.guestAgent = true
+	h.start(20*time.Millisecond, 0)
+	h.waited(h.cli("new", "box"), domain.OpCreate)
+	home := filepath.Join(h.dir, "home")
+	os.MkdirAll(home, 0o700)
+	env := append(os.Environ(), "HOME="+home, "DAVIT_API_URL=unix://"+h.sock, "DAVIT_CURRENT_ID=",
+		"XDG_CONFIG_HOME="+filepath.Join(h.dir, "Library", "Application Support"))
+	cmd := exec.Command(bin, "ssh", "box", "--", "true")
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("davit ssh with a space in the key path: %v\n%s", err, out)
 	}
 }
 
