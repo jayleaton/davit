@@ -432,12 +432,14 @@ Match host %[2]s* exec "%[4]s"
 // %-tokens.
 func sshConfigPath(p string) string { return strings.ReplaceAll(p, "%", "%%") }
 
-// sshConfigQuote double-quotes an ssh_config argument containing spaces.
+// sshConfigQuote double-quotes an ssh_config argument, escaping backslashes
+// and double quotes inside it (backslash first) so a path with whitespace, a
+// quote or a backslash stays one value. ssh_config expands %-tokens after
+// unquoting, so an intentional %C in a ControlPath is preserved.
 func sshConfigQuote(s string) string {
-	if strings.ContainsAny(s, " \t") {
-		return `"` + s + `"`
-	}
-	return s
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }
 
 // remotePathRE matches the VM side of an scp argument: VM:path.

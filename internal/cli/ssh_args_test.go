@@ -68,3 +68,39 @@ func TestOpenSSHArgsParseInOpenSSH(t *testing.T) {
 		t.Fatalf("ssh -G did not accept the certificate path %q:\n%s", f.cert, out)
 	}
 }
+
+// TestOpenSSHQuotedPathsWithQuoteAndBackslash covers values that need quoting
+// and also contain a double quote or a backslash. Inside an ssh_config
+// double-quoted value both are special, so they must be escaped or ssh rejects
+// the line ("invalid quotes") or silently reads a different path. ControlPath
+// keeps its intentional %C token.
+func TestOpenSSHQuotedPathsWithQuoteAndBackslash(t *testing.T) {
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("no OpenSSH client in PATH")
+	}
+	dir := filepath.Join(t.TempDir(), `Application "Support\ssh`)
+	f := filesFor(dir, "davit-box")
+	args := append(openSSHArgs("/bin/false", f, "user"),
+		"-o", "ControlPath="+sshConfigQuote(filepath.Join(dir, "%C")),
+		"-G", "davit-box.invalid")
+	out, err := exec.Command(ssh, args...).CombinedOutput()
+	for _, bad := range []string{"invalid quotes", "extra arguments at end of line"} {
+		if strings.Contains(string(out), bad) {
+			t.Fatalf("OpenSSH rejected quoted paths containing a quote and a backslash (%s):\n%s", bad, out)
+		}
+	}
+	if err != nil {
+		t.Fatalf("ssh -G: %v\n%s", err, out)
+	}
+	// -G prints the unquoted values; ControlPath's %C expands to a hash.
+	for _, want := range []string{
+		"certificatefile " + f.cert,
+		"userknownhostsfile " + f.knownHosts,
+		"controlpath " + dir + string(filepath.Separator),
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("ssh -G did not keep %q:\n%s", want, out)
+		}
+	}
+}
